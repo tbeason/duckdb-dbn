@@ -1,0 +1,59 @@
+# name: test/sql/read_dbn.test
+# description: read_dbn() polymorphic dispatcher
+# group: [sql]
+
+statement error
+SELECT * FROM read_dbn('test/data/test_data.trades.dbn');
+----
+read_dbn
+
+require dbn
+
+# Trades fixture -> dispatches to trades schema (12 cols, action+side VARCHAR)
+query I
+SELECT count(*) FROM read_dbn('test/data/test_data.trades.dbn');
+----
+2
+
+query III
+SELECT typeof(ts_event), typeof(price), typeof(action)
+FROM read_dbn('test/data/test_data.trades.dbn') LIMIT 1;
+----
+TIMESTAMP_NS	DOUBLE	VARCHAR
+
+# MBO fixture -> dispatches to MBO schema (has order_id UBIGINT)
+query I
+SELECT count(*) FROM read_dbn('test/data/test_data.mbo.dbn');
+----
+2
+
+query II
+SELECT typeof(order_id), typeof(channel_id)
+FROM read_dbn('test/data/test_data.mbo.dbn') LIMIT 1;
+----
+UBIGINT	UTINYINT
+
+# MBP-10 fixture -> dispatches to MBP-10 (72 cols including bid_px_09)
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_dbn('test/data/test_data.mbp-10.dbn'));
+----
+72
+
+query I
+SELECT typeof(bid_px_09)
+FROM read_dbn('test/data/test_data.mbp-10.dbn') LIMIT 1;
+----
+DOUBLE
+
+# OHLCV fixture -> dispatches to OHLCV (8 cols, no ts_recv)
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_dbn('test/data/test_data.ohlcv-1s.dbn'));
+----
+8
+
+# Status fixture -> 10 cols, has TriState VARCHARs
+query II
+SELECT typeof(is_trading), typeof(action)
+FROM read_dbn('test/data/test_data.status.dbn') LIMIT 1;
+----
+VARCHAR	USMALLINT

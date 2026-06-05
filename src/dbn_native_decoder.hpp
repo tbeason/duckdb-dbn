@@ -4,24 +4,33 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
+#include "databento/enums.hpp"
 #include "databento/record.hpp"
 
 namespace duckdb_dbn {
 
-// Minimal Phase-2 DBN file reader. Reuses databento-cpp's wire-compatible
-// record struct definitions (TradeMsg, MboMsg, Mbp1Msg, ...) so anyone porting
-// between this extension and databento-cpp sees identical byte layouts.
-//
-// Scope:
-//   - Uncompressed .dbn only (throws on Zstd magic). Phase 3 adds .dbn.zst.
-//   - Reads the ts_out flag from the metadata header so files with ts_out=true
-//     stay aligned record-by-record; the rest of the metadata block is skipped.
-//   - Templated NextAs<T> dispatches per record type, filtered by rtype.
-//   - Variable-length records (e.g. InstrumentDefMsg across DBN v1/v2/v3) are
-//     out of scope: NextAs<T> throws on size mismatch with a clear error.
+// Subset of the DBN metadata block we surface. The full struct in databento-cpp
+// (dbn.hpp's Metadata) pulls in date/date.h which forces a heavy transitive
+// dependency we want to avoid; this is the lightweight, stdlib-only form.
+struct DbnMetadata {
+	std::uint8_t version = 0;
+	std::string dataset; // up to 16 chars, NUL-trimmed
+	// nullopt when the file's schema field is kNullSchema (mixed-schema files)
+	std::optional<databento::Schema> schema;
+	std::int64_t start_ns = 0;
+	std::int64_t end_ns = 0;
+	std::uint64_t limit = 0;
+	// nullopt when stype_in is the file's kNullSType sentinel
+	std::optional<databento::SType> stype_in;
+	databento::SType stype_out = databento::SType::InstrumentId;
+	bool ts_out = false;
+	std::size_t symbol_cstr_len = 0;
+};
+
 class DbnFileReader {
 public:
 	// Worst-case record body in Phase 2/3: v3 InstrumentDefMsg (520 bytes).
@@ -30,26 +39,19 @@ public:
 
 	explicit DbnFileReader(const std::string &path);
 
+	const DbnMetadata &GetMetadata() const {
+		return metadata_;
+	}
 	std::uint8_t Version() const {
-		return version_;
+		return metadata_.version;
 	}
 	bool HasTsOut() const {
-		return ts_out_;
+		return metadata_.ts_out;
 	}
 
-	// Read one record. Returns false at clean EOF; throws on truncation or
-	// oversize records. On success `*hdr` holds the parsed header, `buf` holds
-	// the full record bytes (including header), and `*record_len_bytes` is the
-	// header.length * 4 byte count. If the stream has ts_out=true, the trailing
-	// 8 bytes are consumed and (if `ts_out_out` is non-null) stored.
 	bool NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
 	                   std::uint64_t *ts_out_out);
 
-	// Typed convenience used by the per-schema scan callbacks. Loops calling
-	// NextRecordRaw, skipping records whose rtype != expected_rtype, until one
-	// matches or EOF. On a match, sizeof(T) must equal record_len_bytes
-	// (otherwise we're looking at a v1/v2 variant of a record whose layout
-	// differs from the cpp struct — throws with a version note).
 	template <typename T>
 	bool NextAs(T &out, databento::RType expected_rtype) {
 		static_assert(sizeof(T) <= kMaxRecordLen, "record type larger than reader buffer");
@@ -75,8 +77,7 @@ public:
 
 private:
 	std::ifstream file_;
-	std::uint8_t version_ = 0;
-	bool ts_out_ = false;
+	DbnMetadata metadata_;
 };
 
 } // namespace duckdb_dbn

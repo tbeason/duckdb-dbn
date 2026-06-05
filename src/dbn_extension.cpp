@@ -729,9 +729,233 @@ static void ImbalanceScan(ClientContext &, TableFunctionInput &input, DataChunk 
 	out.SetCardinality(n);
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// Polymorphic read_dbn(path) — probes metadata.schema at bind time and
+// dispatches to the right per-schema bind/scan pair.
+// ════════════════════════════════════════════════════════════════════════════
+
+struct SchemaHandler {
+	const char *display_name;
+	table_function_bind_t bind;
+	table_function_t scan;
+};
+
+static const SchemaHandler *LookupSchemaHandler(databento::Schema s) {
+	switch (s) {
+	case databento::Schema::Trades: {
+		static const SchemaHandler h = {"trades", TradesBind, TradesScan};
+		return &h;
+	}
+	case databento::Schema::Mbo: {
+		static const SchemaHandler h = {"mbo", MboBind, MboScan};
+		return &h;
+	}
+	case databento::Schema::Mbp1: {
+		static const SchemaHandler h = {"mbp-1", Mbp1Bind, Mbp1Scan};
+		return &h;
+	}
+	case databento::Schema::Mbp10: {
+		static const SchemaHandler h = {"mbp-10", Mbp10Bind, Mbp10Scan};
+		return &h;
+	}
+	case databento::Schema::Tbbo: {
+		static const SchemaHandler h = {"tbbo", TbboBind, TbboScan};
+		return &h;
+	}
+	case databento::Schema::Bbo1S: {
+		static const SchemaHandler h = {"bbo-1s", BboBind, Bbo1sScan};
+		return &h;
+	}
+	case databento::Schema::Bbo1M: {
+		static const SchemaHandler h = {"bbo-1m", BboBind, Bbo1mScan};
+		return &h;
+	}
+	case databento::Schema::Cbbo1S: {
+		static const SchemaHandler h = {"cbbo-1s", CbboBind, Cbbo1sScan};
+		return &h;
+	}
+	case databento::Schema::Cmbp1: {
+		static const SchemaHandler h = {"cmbp-1", Cmbp1Bind, Cmbp1Scan};
+		return &h;
+	}
+	case databento::Schema::Ohlcv1S: {
+		static const SchemaHandler h = {"ohlcv-1s", OhlcvBind, Ohlcv1sScan};
+		return &h;
+	}
+	case databento::Schema::Ohlcv1M: {
+		static const SchemaHandler h = {"ohlcv-1m", OhlcvBind, Ohlcv1mScan};
+		return &h;
+	}
+	case databento::Schema::Ohlcv1H: {
+		static const SchemaHandler h = {"ohlcv-1h", OhlcvBind, Ohlcv1hScan};
+		return &h;
+	}
+	case databento::Schema::Ohlcv1D: {
+		static const SchemaHandler h = {"ohlcv-1d", OhlcvBind, Ohlcv1dScan};
+		return &h;
+	}
+	case databento::Schema::Status: {
+		static const SchemaHandler h = {"status", StatusBind, StatusScan};
+		return &h;
+	}
+	case databento::Schema::Imbalance: {
+		static const SchemaHandler h = {"imbalance", ImbalanceBind, ImbalanceScan};
+		return &h;
+	}
+	default:
+		return nullptr;
+	}
+}
+
+static const char *SchemaToCstr(databento::Schema s) {
+	switch (s) {
+	case databento::Schema::Mbo:        return "mbo";
+	case databento::Schema::Mbp1:       return "mbp-1";
+	case databento::Schema::Mbp10:      return "mbp-10";
+	case databento::Schema::Tbbo:       return "tbbo";
+	case databento::Schema::Trades:     return "trades";
+	case databento::Schema::Ohlcv1S:    return "ohlcv-1s";
+	case databento::Schema::Ohlcv1M:    return "ohlcv-1m";
+	case databento::Schema::Ohlcv1H:    return "ohlcv-1h";
+	case databento::Schema::Ohlcv1D:    return "ohlcv-1d";
+	case databento::Schema::Definition: return "definition";
+	case databento::Schema::Statistics: return "statistics";
+	case databento::Schema::Status:     return "status";
+	case databento::Schema::Imbalance:  return "imbalance";
+	case databento::Schema::OhlcvEod:   return "ohlcv-eod";
+	case databento::Schema::Cmbp1:      return "cmbp-1";
+	case databento::Schema::Cbbo1S:     return "cbbo-1s";
+	case databento::Schema::Cbbo1M:     return "cbbo-1m";
+	case databento::Schema::Bbo1S:      return "bbo-1s";
+	case databento::Schema::Bbo1M:      return "bbo-1m";
+	default:                            return "unknown";
+	}
+}
+
+static const char *STypeToCstr(databento::SType s) {
+	switch (s) {
+	case databento::SType::InstrumentId:  return "instrument_id";
+	case databento::SType::RawSymbol:     return "raw_symbol";
+	case databento::SType::Smart:         return "smart";
+	case databento::SType::Continuous:    return "continuous";
+	case databento::SType::Parent:        return "parent";
+	case databento::SType::NasdaqSymbol:  return "nasdaq_symbol";
+	case databento::SType::CmsSymbol:     return "cms_symbol";
+	case databento::SType::Isin:          return "isin";
+	case databento::SType::UsCode:        return "us_code";
+	case databento::SType::BbgCompId:     return "bbg_comp_id";
+	case databento::SType::BbgCompTicker: return "bbg_comp_ticker";
+	case databento::SType::Figi:          return "figi";
+	case databento::SType::FigiTicker:    return "figi_ticker";
+	default:                              return "unknown";
+	}
+}
+
+struct ReadDbnBindDataPolymorphic : public ReadDbnBindData {
+	table_function_t dispatched_scan = nullptr;
+};
+
+static unique_ptr<FunctionData> ReadDbnBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	const auto path = GetFilePathArg(input);
+	duckdb_dbn::DbnFileReader probe(path);
+	const auto &md = probe.GetMetadata();
+	if (!md.schema.has_value()) {
+		throw InvalidInputException("dbn: file '%s' has no schema in metadata (mixed-schema file); "
+		                            "polymorphic read_dbn() can't dispatch — use a specific "
+		                            "read_dbn_<schema>() function instead.",
+		                            path);
+	}
+	const auto *handler = LookupSchemaHandler(*md.schema);
+	if (handler == nullptr) {
+		throw InvalidInputException(
+		    "dbn: schema '%s' is not yet supported by polymorphic read_dbn() (definition / statistics need "
+		    "version-aware decoding; cbbo-1m / ohlcv-eod are not yet wired). File: '%s'.",
+		    SchemaToCstr(*md.schema), path);
+	}
+	(void)handler->bind(context, input, return_types, names);
+	auto bd = make_uniq<ReadDbnBindDataPolymorphic>();
+	bd->file_path = path;
+	bd->dispatched_scan = handler->scan;
+	return std::move(bd);
+}
+
+static void ReadDbnScan(ClientContext &ctx, TableFunctionInput &input, DataChunk &out) {
+	auto &bd = input.bind_data->Cast<ReadDbnBindDataPolymorphic>();
+	bd.dispatched_scan(ctx, input, out);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// dbn_metadata(path) — single-row introspection helper.
+// ════════════════════════════════════════════════════════════════════════════
+
+struct DbnMetadataBindData : public TableFunctionData {
+	std::string file_path;
+};
+
+struct DbnMetadataGlobalState : public GlobalTableFunctionState {
+	bool emitted = false;
+};
+
+static unique_ptr<FunctionData> DbnMetadataBind(ClientContext &, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<string> &names) {
+	auto bd = make_uniq<DbnMetadataBindData>();
+	bd->file_path = GetFilePathArg(input);
+	names = {"version",  "dataset",  "schema",   "start_ts", "end_ts",
+	         "limit",    "stype_in", "stype_out","ts_out",   "symbol_cstr_len"};
+	return_types = {LogicalType::UTINYINT,    LogicalType::VARCHAR,      LogicalType::VARCHAR,
+	                LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::UBIGINT,
+	                LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::BOOLEAN,
+	                LogicalType::UINTEGER};
+	return std::move(bd);
+}
+
+static unique_ptr<GlobalTableFunctionState> DbnMetadataInitGlobal(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<DbnMetadataGlobalState>();
+}
+
+static void DbnMetadataScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
+	auto &state = input.global_state->Cast<DbnMetadataGlobalState>();
+	if (state.emitted) {
+		out.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+
+	auto &bd = input.bind_data->Cast<DbnMetadataBindData>();
+	duckdb_dbn::DbnFileReader reader(bd.file_path);
+	const auto &md = reader.GetMetadata();
+
+	FlatVector::GetData<uint8_t>(out.data[0])[0] = md.version;
+	FlatVector::GetData<string_t>(out.data[1])[0] =
+	    StringVector::AddString(out.data[1], md.dataset.data(), md.dataset.size());
+	if (md.schema.has_value()) {
+		const char *s = SchemaToCstr(*md.schema);
+		FlatVector::GetData<string_t>(out.data[2])[0] = StringVector::AddString(out.data[2], s);
+	} else {
+		FlatVector::Validity(out.data[2]).SetInvalid(0);
+	}
+	FlatVector::GetData<int64_t>(out.data[3])[0] = md.start_ns;
+	FlatVector::GetData<int64_t>(out.data[4])[0] = md.end_ns;
+	FlatVector::GetData<uint64_t>(out.data[5])[0] = md.limit;
+	if (md.stype_in.has_value()) {
+		const char *s = STypeToCstr(*md.stype_in);
+		FlatVector::GetData<string_t>(out.data[6])[0] = StringVector::AddString(out.data[6], s);
+	} else {
+		FlatVector::Validity(out.data[6]).SetInvalid(0);
+	}
+	{
+		const char *s = STypeToCstr(md.stype_out);
+		FlatVector::GetData<string_t>(out.data[7])[0] = StringVector::AddString(out.data[7], s);
+	}
+	FlatVector::GetData<bool>(out.data[8])[0] = md.ts_out;
+	FlatVector::GetData<uint32_t>(out.data[9])[0] = static_cast<uint32_t>(md.symbol_cstr_len);
+	out.SetCardinality(1);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Registration
-// ═════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 
 static void Register(ExtensionLoader &loader, const char *name, table_function_bind_t bind, table_function_t scan) {
 	TableFunction f(name, {LogicalType::VARCHAR}, scan, bind, ReadDbnInitGlobal);
@@ -739,6 +963,7 @@ static void Register(ExtensionLoader &loader, const char *name, table_function_b
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	Register(loader, "read_dbn", ReadDbnBind, ReadDbnScan);
 	Register(loader, "read_dbn_trades", TradesBind, TradesScan);
 	Register(loader, "read_dbn_mbo", MboBind, MboScan);
 	Register(loader, "read_dbn_mbp1", Mbp1Bind, Mbp1Scan);
@@ -754,6 +979,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	Register(loader, "read_dbn_ohlcv_1d", OhlcvBind, Ohlcv1dScan);
 	Register(loader, "read_dbn_status", StatusBind, StatusScan);
 	Register(loader, "read_dbn_imbalance", ImbalanceBind, ImbalanceScan);
+
+	TableFunction mf("dbn_metadata", {LogicalType::VARCHAR}, DbnMetadataScan, DbnMetadataBind, DbnMetadataInitGlobal);
+	loader.RegisterFunction(mf);
 }
 
 void DbnExtension::Load(ExtensionLoader &loader) {

@@ -1,0 +1,72 @@
+# name: test/sql/dbn_metadata.test
+# description: dbn_metadata() introspection helper
+# group: [sql]
+
+statement error
+SELECT * FROM dbn_metadata('test/data/test_data.trades.dbn');
+----
+dbn_metadata
+
+require dbn
+
+# Single-row output
+query I
+SELECT count(*) FROM dbn_metadata('test/data/test_data.trades.dbn');
+----
+1
+
+# Trades fixture: DBN v2, GLBX.MDP3, trades schema
+query ITTITTI
+SELECT
+    version::INTEGER,
+    dataset,
+    schema,
+    epoch_ns(start_ts),
+    stype_in,
+    stype_out,
+    ts_out::VARCHAR
+FROM dbn_metadata('test/data/test_data.trades.dbn');
+----
+2	GLBX.MDP3	trades	1609160400000000000	raw_symbol	instrument_id	false
+
+# MBO fixture: DBN v3 layout
+query ITT
+SELECT version::INTEGER, dataset, schema
+FROM dbn_metadata('test/data/test_data.mbo.dbn');
+----
+3	GLBX.MDP3	mbo
+
+# MBP-1 fixture
+query IT
+SELECT version::INTEGER, schema
+FROM dbn_metadata('test/data/test_data.mbp-1.dbn');
+----
+2	mbp-1
+
+# OHLCV fixture
+query IT
+SELECT version::INTEGER, schema
+FROM dbn_metadata('test/data/test_data.ohlcv-1s.dbn');
+----
+2	ohlcv-1s
+
+# Status fixture (limit=4 matches the 4-record fixture)
+query II
+SELECT schema = 'status', "limit"::BIGINT
+FROM dbn_metadata('test/data/test_data.status.dbn');
+----
+true	4
+
+# Imbalance fixture: different dataset
+query TT
+SELECT dataset, schema
+FROM dbn_metadata('test/data/test_data.imbalance.dbn');
+----
+XNAS.ITCH	imbalance
+
+# Column types
+query III
+SELECT typeof(version), typeof(start_ts), typeof(ts_out)
+FROM dbn_metadata('test/data/test_data.trades.dbn');
+----
+UTINYINT	TIMESTAMP_NS	BOOLEAN
