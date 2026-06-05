@@ -6,3 +6,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "third_party/databento-cpp"]
+	path = third_party/databento-cpp
+	url = https://github.com/databento/databento-cpp.git

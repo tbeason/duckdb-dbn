@@ -1,0 +1,51 @@
+# name: test/sql/dbn.test
+# description: read_dbn() table function — trades schema
+# group: [sql]
+
+# Before the extension is loaded the table function should not exist.
+statement error
+SELECT * FROM read_dbn('test/data/test_data.trades.dbn');
+----
+read_dbn
+
+require dbn
+
+# Row count
+query I
+SELECT count(*) FROM read_dbn('test/data/test_data.trades.dbn');
+----
+2
+
+# Full column-by-column check against Julia-DBN ground truth
+# Columns (in select order):
+#   ts_event(ns), ts_recv(ns), instrument_id, publisher_id,
+#   price, size, action, side, flags, depth, ts_in_delta, sequence
+query IIIIRITTIIII
+SELECT
+    epoch_ns(ts_event),
+    epoch_ns(ts_recv),
+    instrument_id::BIGINT,
+    publisher_id::BIGINT,
+    price,
+    size::BIGINT,
+    action,
+    side,
+    flags::BIGINT,
+    depth::BIGINT,
+    ts_in_delta,
+    sequence::BIGINT
+FROM read_dbn('test/data/test_data.trades.dbn')
+ORDER BY ts_event, sequence;
+----
+1609160400098821953	1609160400099150057	5482	1	3720.25	5	T	A	129	0	19251	1170380
+1609160400107665963	1609160400108142648	5482	1	3720.25	21	T	A	129	0	20728	1170414
+
+# Column metadata / types
+query III
+SELECT
+    typeof(ts_event),
+    typeof(price),
+    typeof(action)
+FROM read_dbn('test/data/test_data.trades.dbn') LIMIT 1;
+----
+TIMESTAMP_NS	DOUBLE	VARCHAR

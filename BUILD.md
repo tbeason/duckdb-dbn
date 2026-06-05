@@ -1,0 +1,132 @@
+# Building `duckdb-dbn` on Windows
+
+This document is the Phase 0 walkthrough: get the unmodified extension template building and loading in DuckDB before any DBN code is added. If this works, the rest of the project is straightforward.
+
+## What's already done
+
+The repo was scaffolded from `duckdb/extension-template` and renamed via the template's `bootstrap-template.py` script. Extension name is `dbn`. Sources live in `src/dbn_extension.cpp` and `src/include/dbn_extension.hpp`. Two placeholder scalar functions exist (`dbn(name)`, `dbn_openssl_version(name)`) — they'll be replaced in Phase 1 by a `read_dbn(path)` table function.
+
+The repo has two git submodules that were NOT cloned yet (to keep the initial scaffold small): `duckdb/` (the full DuckDB source tree, several hundred MB) and `extension-ci-tools/` (build infrastructure). You'll initialize them in step 2 below.
+
+## Prerequisites
+
+Confirmed present on this machine:
+
+- Git 2.54 ✓
+- CMake 3.29 ✓ (needs ≥ 3.5; template's `CMakeLists.txt` line 1)
+- Python 3.13 ✓ (used by template scripts)
+- Visual Studio 2022 ✓ (need the "Desktop development with C++" workload — verify in VS Installer if unsure)
+
+Still required:
+
+- **vcpkg** — not installed. Step 3 below covers this.
+- **GNU make** — the template's `Makefile` is the canonical build entrypoint, but `nmake` won't work here. Options:
+  - Use `make` from Git for Windows (`C:\Program Files\Git\usr\bin\make.exe`) — usually present, just not on PATH.
+  - Use WSL (Ubuntu) for the whole build flow — simplest if Windows-native is fighting you.
+  - Skip `make` and invoke CMake directly (documented below).
+- **DuckDB CLI** — download the prebuilt Windows binary from <https://duckdb.org/docs/installation/> if you want to test extension loading. The build also produces a `duckdb.exe` with the extension preloaded, so this is optional.
+
+## Build steps
+
+### 1. Open a Developer PowerShell for VS 2022
+
+Critical — without this, `cl.exe` and the MSVC runtime aren't on PATH. Start menu → "Developer PowerShell for VS 2022", or run:
+```powershell
+& 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1'
+```
+(adjust the edition path if you have Professional/Enterprise)
+
+Verify:
+```powershell
+cl.exe   # should print "Microsoft (R) C/C++ Optimizing Compiler..."
+```
+
+### 2. Initialize submodules (this is the slow step)
+
+```powershell
+cd C:\Users\tbeas\Documents\GitHub\duckdb-dbn
+git submodule update --init --recursive
+```
+
+Expect several hundred MB and several minutes. The DuckDB submodule has its own submodules.
+
+### 3. Install vcpkg
+
+```powershell
+git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
+C:\vcpkg\bootstrap-vcpkg.bat
+$env:VCPKG_TOOLCHAIN_PATH = "C:\vcpkg\scripts\buildsystems\vcpkg.cmake"
+```
+
+For convenience, add `VCPKG_TOOLCHAIN_PATH` as a persistent user env var via System Properties → Environment Variables.
+
+### 4. Build
+
+**Option A — via the template's Makefile (if `make` is available):**
+```powershell
+$env:Path = "C:\Program Files\Git\usr\bin;$env:Path"   # put git-bash make on PATH
+make
+```
+
+**Option B — direct CMake invocation (more reliable on Windows):**
+```powershell
+cmake -B build/release -S . `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_TOOLCHAIN_PATH" `
+  -DEXTENSION_STATIC_BUILD=1 `
+  -DDUCKDB_EXTENSION_CONFIGS="$PWD\extension_config.cmake"
+
+cmake --build build/release --config Release
+```
+
+First build is slow (vcpkg compiles OpenSSL; DuckDB itself compiles). Subsequent rebuilds use the cache. Expect 15–30 minutes for the first run.
+
+### 5. Locate and load the extension
+
+After a successful build:
+```
+build/release/extension/dbn/dbn.duckdb_extension
+build/release/duckdb.exe          (DuckDB CLI with extension pre-linked)
+```
+
+Load it manually in any DuckDB CLI:
+```sql
+-- Launch DuckDB CLI with unsigned extensions allowed
+-- > duckdb.exe -unsigned
+
+LOAD 'C:/Users/tbeas/Documents/GitHub/duckdb-dbn/build/release/extension/dbn/dbn.duckdb_extension';
+SELECT dbn('Phase 0 works');
+-- Expected: ...........🦆 Phase 0 works
+```
+
+Or use the build's preloaded `duckdb.exe`:
+```powershell
+.\build\release\duckdb.exe
+SELECT dbn('Phase 0 works');
+```
+
+### 6. Run the template's test suite
+
+```powershell
+make test
+# or:
+.\build\release\test\unittest.exe --test-dir . "[sql]"
+```
+
+The test in `test/sql/dbn.test` asserts the two placeholder functions work. Pass = Phase 0 done.
+
+## Common failure modes
+
+- **`cl.exe not found`** — you're not in a Developer PowerShell. Re-launch.
+- **vcpkg `find_package(OpenSSL)` fails** — `VCPKG_TOOLCHAIN_PATH` not exported. Echo it (`$env:VCPKG_TOOLCHAIN_PATH`) to confirm.
+- **Linker errors about missing DuckDB symbols** — submodules not initialized. Re-run `git submodule update --init --recursive`.
+- **CMake picks the wrong generator** — explicitly pass `-G "Visual Studio 17 2022" -A x64` to the configure step.
+- **Build runs out of disk** — vcpkg + DuckDB build artifacts together are 5–10 GB. Have headroom.
+
+## When Phase 0 is done
+
+You should be able to launch a DuckDB CLI, `LOAD` the built extension, and run `SELECT dbn('hi');` returning the duck emoji string. At that point we know the toolchain is healthy and Phase 1 (replacing the placeholder functions with `read_dbn(path)` backed by `databento-cpp`) is just C++.
+
+## When Phase 0 doesn't work after a real effort
+
+If the Windows-native path keeps fighting, fall back to WSL Ubuntu. The DuckDB extension community largely develops on Linux/macOS and the template's `make` flow works there with no fuss. The resulting extension binary is per-platform anyway — you'd cross-build for Windows from CI later (Phase 5).
