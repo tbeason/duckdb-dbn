@@ -2,9 +2,13 @@
 
 #include <array>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <vector>
+
+#define ZSTD_STATIC_LINKING_ONLY 1
+#include <zstd.h>
 
 namespace duckdb_dbn {
 
@@ -22,15 +26,6 @@ constexpr std::size_t kSymbolCstrLenV1 = 22;
 constexpr std::uint16_t kNullSchema = std::numeric_limits<std::uint16_t>::max();
 constexpr std::uint8_t kNullSType = std::numeric_limits<std::uint8_t>::max();
 
-// Fixed metadata layout offsets (from start of metadata block, not file).
-//   0..15  dataset cstr
-//   16..17 schema u16
-//   18..25 start  u64
-//   26..33 end    u64
-//   34..41 limit  u64
-//   v1 ONLY: 42..49 deprecated record_count u64
-//   then: stype_in u8, stype_out u8, ts_out u8 (in that order)
-//   v2+: symbol_cstr_len u16
 constexpr std::size_t kOffSchema = 16;
 constexpr std::size_t kOffStart = 18;
 constexpr std::size_t kOffEnd = 26;
@@ -45,23 +40,124 @@ T ReadLE(const std::uint8_t *p) {
 	return v;
 }
 
-} // namespace
+// Plain file source.
+class FileInput : public IDbnInput {
+public:
+	explicit FileInput(const std::string &path) : f_(path, std::ios::binary) {
+		if (!f_) {
+			throw std::runtime_error("dbn: failed to open file: " + path);
+		}
+	}
+	std::size_t Read(char *buf, std::size_t n) override {
+		f_.read(buf, static_cast<std::streamsize>(n));
+		return static_cast<std::size_t>(f_.gcount());
+	}
 
-DbnFileReader::DbnFileReader(const std::string &path) : file_(path, std::ios::binary) {
-	if (!file_) {
+private:
+	std::ifstream f_;
+};
+
+// Streaming Zstd decompressor over a file. Uses DuckDB's bundled zstd in the
+// `duckdb_zstd::` namespace, so no extra linkage is required.
+class ZstdInput : public IDbnInput {
+public:
+	explicit ZstdInput(const std::string &path) : f_(path, std::ios::binary) {
+		if (!f_) {
+			throw std::runtime_error("dbn: failed to open file: " + path);
+		}
+		dstream_ = duckdb_zstd::ZSTD_createDStream();
+		if (!dstream_) {
+			throw std::runtime_error("dbn: ZSTD_createDStream returned null");
+		}
+		const auto init_ret = duckdb_zstd::ZSTD_initDStream(dstream_);
+		if (duckdb_zstd::ZSTD_isError(init_ret)) {
+			throw std::runtime_error(std::string("dbn: ZSTD_initDStream: ") +
+			                         duckdb_zstd::ZSTD_getErrorName(init_ret));
+		}
+		in_buf_.resize(duckdb_zstd::ZSTD_DStreamInSize());
+		zin_.src = in_buf_.data();
+		zin_.size = 0;
+		zin_.pos = 0;
+	}
+	~ZstdInput() override {
+		if (dstream_) {
+			duckdb_zstd::ZSTD_freeDStream(dstream_);
+		}
+	}
+
+	std::size_t Read(char *buf, std::size_t n) override {
+		duckdb_zstd::ZSTD_outBuffer zout {};
+		zout.dst = buf;
+		zout.size = n;
+		zout.pos = 0;
+
+		while (zout.pos < n) {
+			if (zin_.pos == zin_.size) {
+				f_.read(in_buf_.data(), static_cast<std::streamsize>(in_buf_.size()));
+				const auto got = static_cast<std::size_t>(f_.gcount());
+				if (got == 0) {
+					// no more compressed input — return whatever we managed to
+					// decompress this call (may be 0 = clean EOF).
+					return zout.pos;
+				}
+				zin_.size = got;
+				zin_.pos = 0;
+			}
+			const auto ret = duckdb_zstd::ZSTD_decompressStream(dstream_, &zout, &zin_);
+			if (duckdb_zstd::ZSTD_isError(ret)) {
+				throw std::runtime_error(std::string("dbn: zstd decompression error: ") +
+				                         duckdb_zstd::ZSTD_getErrorName(ret));
+			}
+			// ret == 0 means end of a frame; subsequent calls will start a new
+			// frame if any. Continue the loop until zout is full or EOF.
+		}
+		return zout.pos;
+	}
+
+private:
+	std::ifstream f_;
+	duckdb_zstd::ZSTD_DStream *dstream_ = nullptr;
+	std::vector<char> in_buf_;
+	duckdb_zstd::ZSTD_inBuffer zin_ {};
+};
+
+std::unique_ptr<IDbnInput> OpenInput(const std::string &path) {
+	// Peek the first 4 bytes to choose the right input type.
+	std::ifstream peek(path, std::ios::binary);
+	if (!peek) {
 		throw std::runtime_error("dbn: failed to open file: " + path);
 	}
-
-	std::array<std::uint8_t, kMetadataPreludeSize> prelude {};
-	file_.read(reinterpret_cast<char *>(prelude.data()), prelude.size());
-	if (file_.gcount() != static_cast<std::streamsize>(prelude.size())) {
-		throw std::runtime_error("dbn: file too short to contain metadata prelude");
+	std::array<std::uint8_t, kMagicSize> magic {};
+	peek.read(reinterpret_cast<char *>(magic.data()), magic.size());
+	if (peek.gcount() != static_cast<std::streamsize>(magic.size())) {
+		throw std::runtime_error("dbn: file too short to contain magic bytes");
 	}
+	peek.close();
 
-	std::uint32_t magic_word = ReadLE<std::uint32_t>(prelude.data());
+	const std::uint32_t magic_word = ReadLE<std::uint32_t>(magic.data());
 	if (magic_word == kZstdMagicNumber) {
-		throw std::runtime_error("dbn: Zstd-compressed .dbn.zst is not yet supported (Phase 3-B)");
+		return std::make_unique<ZstdInput>(path);
 	}
+	if (std::memcmp(magic.data(), kDbnPrefix, 3) == 0) {
+		return std::make_unique<FileInput>(path);
+	}
+	throw std::runtime_error("dbn: file '" + path + "' is neither a DBN file nor a Zstd-compressed DBN file");
+}
+
+// Read exactly `n` bytes from `input`, throwing on short read.
+void ReadExact(IDbnInput &input, void *buf, std::size_t n, const char *what) {
+	const auto got = input.Read(reinterpret_cast<char *>(buf), n);
+	if (got != n) {
+		throw std::runtime_error(std::string("dbn: short read while reading ") + what + " (expected " +
+		                         std::to_string(n) + " bytes, got " + std::to_string(got) + ")");
+	}
+}
+
+} // namespace
+
+DbnFileReader::DbnFileReader(const std::string &path) : input_(OpenInput(path)) {
+	std::array<std::uint8_t, kMetadataPreludeSize> prelude {};
+	ReadExact(*input_, prelude.data(), prelude.size(), "metadata prelude");
 
 	if (std::memcmp(prelude.data(), kDbnPrefix, 3) != 0) {
 		throw std::runtime_error("dbn: missing DBN prefix in file header");
@@ -74,10 +170,7 @@ DbnFileReader::DbnFileReader(const std::string &path) : file_(path, std::ios::bi
 	}
 
 	std::vector<std::uint8_t> meta_buf(frame_size);
-	file_.read(reinterpret_cast<char *>(meta_buf.data()), static_cast<std::streamsize>(frame_size));
-	if (file_.gcount() != static_cast<std::streamsize>(frame_size)) {
-		throw std::runtime_error("dbn: file too short to contain advertised metadata frame");
-	}
+	ReadExact(*input_, meta_buf.data(), frame_size, "metadata frame");
 
 	const auto *ds_ptr = reinterpret_cast<const char *>(meta_buf.data());
 	const auto ds_len = ::strnlen(ds_ptr, kDatasetCstrLen);
@@ -109,12 +202,11 @@ DbnFileReader::DbnFileReader(const std::string &path) : file_(path, std::ios::bi
 
 bool DbnFileReader::NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
                                   std::uint64_t *ts_out_out) {
-	file_.read(reinterpret_cast<char *>(buf), sizeof(databento::RecordHeader));
-	const auto got = file_.gcount();
+	const auto got = input_->Read(reinterpret_cast<char *>(buf), sizeof(databento::RecordHeader));
 	if (got == 0) {
 		return false;
 	}
-	if (got != static_cast<std::streamsize>(sizeof(databento::RecordHeader))) {
+	if (got != sizeof(databento::RecordHeader)) {
 		throw std::runtime_error("dbn: truncated record header at end of file");
 	}
 
@@ -130,11 +222,7 @@ bool DbnFileReader::NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, 
 
 	const std::size_t remaining = record_bytes - sizeof(databento::RecordHeader);
 	if (remaining > 0) {
-		file_.read(reinterpret_cast<char *>(buf) + sizeof(databento::RecordHeader),
-		           static_cast<std::streamsize>(remaining));
-		if (file_.gcount() != static_cast<std::streamsize>(remaining)) {
-			throw std::runtime_error("dbn: truncated record body");
-		}
+		ReadExact(*input_, reinterpret_cast<char *>(buf) + sizeof(databento::RecordHeader), remaining, "record body");
 	}
 
 	if (record_len_bytes) {
@@ -143,10 +231,7 @@ bool DbnFileReader::NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, 
 
 	if (metadata_.ts_out) {
 		std::uint64_t trailer = 0;
-		file_.read(reinterpret_cast<char *>(&trailer), sizeof(trailer));
-		if (file_.gcount() != static_cast<std::streamsize>(sizeof(trailer))) {
-			throw std::runtime_error("dbn: truncated ts_out trailer");
-		}
+		ReadExact(*input_, &trailer, sizeof(trailer), "ts_out trailer");
 		if (ts_out_out) {
 			*ts_out_out = trailer;
 		}

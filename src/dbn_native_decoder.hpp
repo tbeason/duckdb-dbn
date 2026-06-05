@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -19,22 +19,29 @@ namespace duckdb_dbn {
 struct DbnMetadata {
 	std::uint8_t version = 0;
 	std::string dataset; // up to 16 chars, NUL-trimmed
-	// nullopt when the file's schema field is kNullSchema (mixed-schema files)
 	std::optional<databento::Schema> schema;
 	std::int64_t start_ns = 0;
 	std::int64_t end_ns = 0;
 	std::uint64_t limit = 0;
-	// nullopt when stype_in is the file's kNullSType sentinel
 	std::optional<databento::SType> stype_in;
 	databento::SType stype_out = databento::SType::InstrumentId;
 	bool ts_out = false;
 	std::size_t symbol_cstr_len = 0;
 };
 
+// Abstract byte-source the decoder reads from. Two implementations live in
+// the .cpp: a plain file reader and a streaming Zstd decompressor that uses
+// DuckDB's bundled `duckdb_zstd::` namespace.
+class IDbnInput {
+public:
+	virtual ~IDbnInput() = default;
+	// Read up to `n` bytes into `buf`. Returns the number of bytes actually
+	// read; a value < n indicates EOF.
+	virtual std::size_t Read(char *buf, std::size_t n) = 0;
+};
+
 class DbnFileReader {
 public:
-	// Worst-case record body in Phase 2/3: v3 InstrumentDefMsg (520 bytes).
-	// + 8 bytes for an optional ts_out trailer that some streams append per record.
 	static constexpr std::size_t kMaxRecordLen = 528;
 
 	explicit DbnFileReader(const std::string &path);
@@ -76,7 +83,7 @@ public:
 	}
 
 private:
-	std::ifstream file_;
+	std::unique_ptr<IDbnInput> input_;
 	DbnMetadata metadata_;
 };
 
