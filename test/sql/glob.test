@@ -1,0 +1,31 @@
+# name: test/sql/glob.test
+# description: multi-file glob support — read_dbn* accepts patterns
+# group: [sql]
+
+require dbn
+
+# Single-file pattern matches one file: backward-compat with literal paths.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn');
+----
+2
+
+# Multi-file glob: two identical-content files matched by glob_trades_*.dbn.
+# Each has 2 rows; total = 4. Rows concatenate file-by-file in order.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/glob_trades_*.dbn');
+----
+4
+
+# Polymorphic read_dbn() accepts globs and dispatches based on the first
+# matched file's schema.
+query I
+SELECT count(*) FROM read_dbn('test/data/glob_trades_*.dbn');
+----
+4
+
+# Non-matching pattern throws.
+statement error
+SELECT * FROM read_dbn_trades('test/data/does_not_exist_*.dbn');
+----
+no files match

@@ -3,13 +3,22 @@
 #include "dbn_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/function/replacement_scan.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include <memory>
 #include <utility>
 
 #include "databento/enums.hpp"
 #include "databento/record.hpp"
+#include "databento/v1.hpp"
+#include "databento/v2.hpp"
 #include "dbn_emit_helpers.hpp"
 #include "dbn_native_decoder.hpp"
 
@@ -21,22 +30,40 @@ namespace duckdb {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct ReadDbnBindData : public TableFunctionData {
-	std::string file_path;
+	// Resolved at bind time. Always at least one entry; multiple entries
+	// when the user passed a glob pattern.
+	std::vector<std::string> file_paths;
 };
 
 struct ReadDbnGlobalState : public GlobalTableFunctionState {
-	explicit ReadDbnGlobalState(const std::string &path)
-	    : reader(std::make_unique<duckdb_dbn::DbnFileReader>(path)) {}
+	explicit ReadDbnGlobalState(std::vector<std::string> paths)
+	    : reader(std::make_unique<duckdb_dbn::DbnFileReader>(std::move(paths))) {}
 	std::unique_ptr<duckdb_dbn::DbnFileReader> reader;
 };
 
 static unique_ptr<GlobalTableFunctionState> ReadDbnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
 	auto &bd = input.bind_data->Cast<ReadDbnBindData>();
-	return make_uniq<ReadDbnGlobalState>(bd.file_path);
+	return make_uniq<ReadDbnGlobalState>(bd.file_paths);
 }
 
 static std::string GetFilePathArg(TableFunctionBindInput &input) {
 	return input.inputs[0].GetValue<string>();
+}
+
+// Expand a glob (or literal path) into a list of files. Throws if no file
+// matches the pattern.
+static std::vector<std::string> ExpandPaths(ClientContext &context, const std::string &pattern) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto opens = fs.Glob(pattern);
+	std::vector<std::string> paths;
+	paths.reserve(opens.size());
+	for (const auto &of : opens) {
+		paths.push_back(of.path);
+	}
+	if (paths.empty()) {
+		throw IOException("dbn: no files match: " + pattern);
+	}
+	return paths;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,10 +79,10 @@ static inline int64_t TsToInt64(databento::UnixNanos t) {
 // Mirrors Julia trades_to_dataframe ordering.
 // ═════════════════════════════════════════════════════════════════════════════
 
-static unique_ptr<FunctionData> TradesBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> TradesBind(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
-	bd->file_path = GetFilePathArg(input);
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
 	names = {"ts_event", "ts_recv", "instrument_id", "publisher_id", "price",       "size",
 	         "action",   "side",    "flags",         "depth",        "ts_in_delta", "sequence"};
 	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::UINTEGER,
@@ -105,10 +132,10 @@ static void TradesScan(ClientContext &, TableFunctionInput &input, DataChunk &ou
 // Mirrors Julia mbo_to_dataframe ordering.
 // ═════════════════════════════════════════════════════════════════════════════
 
-static unique_ptr<FunctionData> MboBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> MboBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
-	bd->file_path = GetFilePathArg(input);
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
 	names = {"ts_event", "ts_recv", "instrument_id", "publisher_id", "order_id",   "price",      "size",
 	         "flags",    "channel_id", "action",     "side",         "ts_in_delta", "sequence"};
 	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::UINTEGER,
@@ -162,10 +189,10 @@ static void MboScan(ClientContext &, TableFunctionInput &input, DataChunk &out) 
 // Mirrors Julia mbp1_to_dataframe (action/side last).
 // ═════════════════════════════════════════════════════════════════════════════
 
-static unique_ptr<FunctionData> Mbp1Bind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> Mbp1Bind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
-	bd->file_path = GetFilePathArg(input);
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
 	names = {"ts_event",  "ts_recv",  "instrument_id", "publisher_id", "bid_price",
 	         "ask_price", "bid_size", "ask_size",      "bid_ct",       "ask_ct",
 	         "flags",     "ts_in_delta", "sequence",   "action",       "side"};
@@ -247,10 +274,10 @@ static std::string LevelCol(const char *prefix, int i) {
 	return std::string(buf);
 }
 
-static unique_ptr<FunctionData> Mbp10Bind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> Mbp10Bind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
-	bd->file_path = GetFilePathArg(input);
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
 	names = {"ts_event",    "ts_recv", "instrument_id", "publisher_id", "price", "size",
 	         "action",      "side",    "flags",         "depth",        "ts_in_delta", "sequence"};
 	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::UINTEGER,
@@ -335,10 +362,10 @@ static void Mbp10Scan(ClientContext &, TableFunctionInput &input, DataChunk &out
 // No action/depth/ts_in_delta. levels[0] flattened.
 // ═════════════════════════════════════════════════════════════════════════════
 
-static unique_ptr<FunctionData> BboBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> BboBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
-	bd->file_path = GetFilePathArg(input);
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
 	names = {"ts_event",  "ts_recv",  "instrument_id", "publisher_id", "price",
 	         "size",      "side",     "flags",         "bid_price",    "ask_price",
 	         "bid_size",  "ask_size", "bid_ct",        "ask_ct",       "sequence"};
@@ -404,10 +431,10 @@ static void Bbo1mScan(ClientContext &c, TableFunctionInput &input, DataChunk &ou
 // Uses ConsolidatedBidAskPair: bid_pb/ask_pb (publisher bitmask) instead of bid_ct/ask_ct.
 // ═════════════════════════════════════════════════════════════════════════════
 
-static unique_ptr<FunctionData> CbboBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> CbboBind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
-	bd->file_path = GetFilePathArg(input);
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
 	names = {"ts_event", "ts_recv",   "instrument_id", "publisher_id", "price",    "size",   "side",   "flags",
 	         "bid_price","ask_price", "bid_size",      "ask_size",     "bid_pb",   "ask_pb"};
 	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::UINTEGER,
@@ -470,10 +497,10 @@ static void Cbbo1mScan(ClientContext &c, TableFunctionInput &input, DataChunk &o
 // Like Mbp1 but with ConsolidatedBidAskPair (bid_pb/ask_pb).
 // ═════════════════════════════════════════════════════════════════════════════
 
-static unique_ptr<FunctionData> Cmbp1Bind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> Cmbp1Bind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
-	bd->file_path = GetFilePathArg(input);
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
 	names = {"ts_event",  "ts_recv",  "instrument_id", "publisher_id", "price",
 	         "size",      "action",   "side",          "flags",        "ts_in_delta",
 	         "bid_price", "ask_price","bid_size",      "ask_size",     "bid_pb",
@@ -543,10 +570,10 @@ static void TcbboScan(ClientContext &c, TableFunctionInput &input, DataChunk &ou
 // 8 columns: ts_event, instrument_id, publisher_id, open, high, low, close, volume.
 // ═════════════════════════════════════════════════════════════════════════════
 
-static unique_ptr<FunctionData> OhlcvBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> OhlcvBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
-	bd->file_path = GetFilePathArg(input);
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
 	names = {"ts_event", "instrument_id", "publisher_id", "open", "high", "low", "close", "volume"};
 	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::UINTEGER, LogicalType::USMALLINT, LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,       LogicalType::DOUBLE,   LogicalType::DOUBLE,    LogicalType::UBIGINT};
@@ -602,10 +629,10 @@ static void OhlcvEodScan(ClientContext &c, TableFunctionInput &i, DataChunk &o) 
 // is_trading/is_quoting/is_short_sell_restricted as 1-char VARCHAR (TriState).
 // ═════════════════════════════════════════════════════════════════════════════
 
-static unique_ptr<FunctionData> StatusBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> StatusBind(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
-	bd->file_path = GetFilePathArg(input);
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
 	names = {"ts_event",       "ts_recv",        "instrument_id",            "publisher_id", "action",
 	         "reason",         "trading_event",  "is_trading",               "is_quoting",   "is_short_sell_restricted"};
 	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::UINTEGER,
@@ -651,10 +678,10 @@ static void StatusScan(ClientContext &, TableFunctionInput &input, DataChunk &ou
 // 23 columns; mirrors the wire layout (Julia's mapper has known bugs).
 // ═════════════════════════════════════════════════════════════════════════════
 
-static unique_ptr<FunctionData> ImbalanceBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> ImbalanceBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
-	bd->file_path = GetFilePathArg(input);
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
 	names = {"ts_event",
 	         "ts_recv",
 	         "instrument_id",
@@ -747,6 +774,408 @@ static void ImbalanceScan(ClientContext &, TableFunctionInput &input, DataChunk 
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// statistics — RType::Statistics, StatMsg.
+// Version-aware: v1/v2 StatMsg is 64 bytes with int32 quantity; v3 is 80 bytes
+// with int64 quantity. Canonical exposed type is BIGINT — v1/v2 quantity is
+// sign-extended, with the kUndefStatQuantityV1 sentinel (INT32_MAX) mapped
+// to the v3 sentinel value (INT64_MAX).
+// ════════════════════════════════════════════════════════════════════════════
+
+static unique_ptr<FunctionData> StatisticsBind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	auto bd = make_uniq<ReadDbnBindData>();
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
+	names = {"ts_event",   "ts_recv",       "ts_ref",      "instrument_id", "publisher_id",
+	         "price",      "quantity",      "sequence",    "ts_in_delta",   "stat_type",
+	         "channel_id", "update_action", "stat_flags"};
+	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS,
+	                LogicalType::UINTEGER,     LogicalType::USMALLINT,    LogicalType::DOUBLE,
+	                LogicalType::BIGINT,       LogicalType::UINTEGER,     LogicalType::INTEGER,
+	                LogicalType::USMALLINT,    LogicalType::USMALLINT,    LogicalType::UTINYINT,
+	                LogicalType::UTINYINT};
+	return std::move(bd);
+}
+
+static void StatisticsScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
+	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
+	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
+	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
+	auto ts_ref = FlatVector::GetData<int64_t>(out.data[2]);
+	auto instr = FlatVector::GetData<uint32_t>(out.data[3]);
+	auto pub = FlatVector::GetData<uint16_t>(out.data[4]);
+	auto price = FlatVector::GetData<double>(out.data[5]);
+	auto quantity = FlatVector::GetData<int64_t>(out.data[6]);
+	auto seq = FlatVector::GetData<uint32_t>(out.data[7]);
+	auto ts_in_d = FlatVector::GetData<int32_t>(out.data[8]);
+	auto stat_type = FlatVector::GetData<uint16_t>(out.data[9]);
+	auto chan = FlatVector::GetData<uint16_t>(out.data[10]);
+	auto update_action = FlatVector::GetData<uint8_t>(out.data[11]);
+	auto stat_flags = FlatVector::GetData<uint8_t>(out.data[12]);
+
+	const auto version = st.reader->Version();
+	const bool use_v1 = (version == 1 || version == 2);
+
+	idx_t n = 0;
+	if (use_v1) {
+		databento::v1::StatMsg rec {};
+		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Statistics)) {
+			ts_event[n] = TsToInt64(rec.hd.ts_event);
+			ts_recv[n] = TsToInt64(rec.ts_recv);
+			ts_ref[n] = TsToInt64(rec.ts_ref);
+			instr[n] = rec.hd.instrument_id;
+			pub[n] = rec.hd.publisher_id;
+			price[n] = static_cast<double>(rec.price) * 1e-9;
+			// Sign-extend quantity, mapping the v1 UNDEF sentinel (INT32_MAX) to
+			// the v3 sentinel (INT64_MAX) so consumers can treat the column uniformly.
+			if (rec.quantity == std::numeric_limits<std::int32_t>::max()) {
+				quantity[n] = std::numeric_limits<std::int64_t>::max();
+			} else {
+				quantity[n] = static_cast<int64_t>(rec.quantity);
+			}
+			seq[n] = rec.sequence;
+			ts_in_d[n] = static_cast<int32_t>(rec.ts_in_delta.count());
+			stat_type[n] = static_cast<uint16_t>(rec.stat_type);
+			chan[n] = rec.channel_id;
+			update_action[n] = static_cast<uint8_t>(rec.update_action);
+			stat_flags[n] = rec.stat_flags;
+			++n;
+		}
+	} else {
+		databento::StatMsg rec {};
+		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Statistics)) {
+			ts_event[n] = TsToInt64(rec.hd.ts_event);
+			ts_recv[n] = TsToInt64(rec.ts_recv);
+			ts_ref[n] = TsToInt64(rec.ts_ref);
+			instr[n] = rec.hd.instrument_id;
+			pub[n] = rec.hd.publisher_id;
+			price[n] = static_cast<double>(rec.price) * 1e-9;
+			quantity[n] = rec.quantity;
+			seq[n] = rec.sequence;
+			ts_in_d[n] = static_cast<int32_t>(rec.ts_in_delta.count());
+			stat_type[n] = static_cast<uint16_t>(rec.stat_type);
+			chan[n] = rec.channel_id;
+			update_action[n] = static_cast<uint8_t>(rec.update_action);
+			stat_flags[n] = rec.stat_flags;
+			++n;
+		}
+	}
+	out.SetCardinality(n);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// definition — RType::InstrumentDef, InstrumentDefMsg.
+// Version-aware: v1 = 360 bytes, v2 = 400 bytes, v3 = 520 bytes. Canonical
+// column layout is the union of all fields seen across versions. Fields not
+// present in the source file's DBN version are emitted as SQL NULL — the
+// 8 leg_* fields and a few v3 additions are NULL for v1/v2 sources; the
+// 4 deprecated fields (trading_reference_price, trading_reference_date,
+// md_security_trading_status, settl_price_type) are NULL for v3 sources.
+// ════════════════════════════════════════════════════════════════════════════
+
+static unique_ptr<FunctionData> DefinitionBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	auto bd = make_uniq<ReadDbnBindData>();
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
+	names = {"ts_event", "ts_recv", "instrument_id", "publisher_id",
+	         "raw_symbol", "instrument_class", "security_type", "exchange",
+	         "asset", "cfi", "currency", "settl_currency",
+	         "secsubtype", "group", "underlying", "strike_price_currency",
+	         "unit_of_measure", "expiration", "activation", "min_price_increment",
+	         "display_factor", "high_limit_price", "low_limit_price", "max_price_variation",
+	         "strike_price", "unit_of_measure_qty", "min_price_increment_amount", "price_ratio",
+	         "raw_instrument_id", "underlying_id", "inst_attrib_value", "market_depth_implied",
+	         "market_depth", "market_segment_id", "max_trade_vol", "min_lot_size",
+	         "min_lot_size_block", "min_lot_size_round_lot", "min_trade_vol", "contract_multiplier",
+	         "decay_quantity", "original_contract_size", "appl_id", "maturity_year",
+	         "decay_start_date", "channel_id", "match_algorithm", "main_fraction",
+	         "price_display_format", "sub_fraction", "underlying_product", "security_update_action",
+	         "maturity_month", "maturity_day", "maturity_week", "user_defined_instrument",
+	         "contract_multiplier_unit", "flow_schedule_type", "tick_rule", "leg_count",
+	         "leg_index", "leg_instrument_id", "leg_raw_symbol", "leg_instrument_class",
+	         "leg_side", "leg_price", "leg_delta", "leg_ratio_price_numerator",
+	         "leg_ratio_price_denominator", "leg_ratio_qty_numerator", "leg_ratio_qty_denominator", "leg_underlying_id",
+	         "trading_reference_price", "trading_reference_date", "md_security_trading_status", "settl_price_type"};
+	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::UINTEGER,
+	                LogicalType::USMALLINT, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP_NS,
+	                LogicalType::TIMESTAMP_NS, LogicalType::DOUBLE, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE, LogicalType::UBIGINT, LogicalType::UINTEGER,
+	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::UINTEGER, LogicalType::UINTEGER, LogicalType::INTEGER,
+	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::UINTEGER,
+	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::SMALLINT, LogicalType::USMALLINT, LogicalType::USMALLINT,
+	                LogicalType::USMALLINT, LogicalType::VARCHAR, LogicalType::UTINYINT,
+	                LogicalType::UTINYINT, LogicalType::UTINYINT, LogicalType::UTINYINT,
+	                LogicalType::VARCHAR, LogicalType::UTINYINT, LogicalType::UTINYINT,
+	                LogicalType::UTINYINT, LogicalType::VARCHAR, LogicalType::TINYINT,
+	                LogicalType::TINYINT, LogicalType::UTINYINT, LogicalType::USMALLINT,
+	                LogicalType::USMALLINT, LogicalType::UINTEGER, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::UINTEGER,
+	                LogicalType::DOUBLE, LogicalType::USMALLINT, LogicalType::UTINYINT,
+	                LogicalType::UTINYINT};
+	return std::move(bd);
+}
+
+static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
+	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
+	const auto version = st.reader->Version();
+	idx_t n = 0;
+	if (version >= 3) {
+		databento::InstrumentDefMsg rec {};
+		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::InstrumentDef)) {
+			FlatVector::GetData<int64_t>(out.data[0])[n] = static_cast<int64_t>((rec.hd.ts_event).time_since_epoch().count());
+			FlatVector::GetData<int64_t>(out.data[1])[n] = static_cast<int64_t>((rec.ts_recv).time_since_epoch().count());
+			FlatVector::GetData<uint32_t>(out.data[2])[n] = rec.hd.instrument_id;
+			FlatVector::GetData<uint16_t>(out.data[3])[n] = rec.hd.publisher_id;
+			FlatVector::GetData<string_t>(out.data[4])[n] = duckdb_dbn::EmitCstr(out.data[4], rec.RawSymbol(), 64);
+			FlatVector::GetData<string_t>(out.data[5])[n] = duckdb_dbn::EmitChar1(out.data[5], static_cast<char>(rec.instrument_class));
+			FlatVector::GetData<string_t>(out.data[6])[n] = duckdb_dbn::EmitCstr(out.data[6], rec.SecurityType(), 7);
+			FlatVector::GetData<string_t>(out.data[7])[n] = duckdb_dbn::EmitCstr(out.data[7], rec.Exchange(), 5);
+			FlatVector::GetData<string_t>(out.data[8])[n] = duckdb_dbn::EmitCstr(out.data[8], rec.Asset(), 11);
+			FlatVector::GetData<string_t>(out.data[9])[n] = duckdb_dbn::EmitCstr(out.data[9], rec.Cfi(), 7);
+			FlatVector::GetData<string_t>(out.data[10])[n] = duckdb_dbn::EmitCstr(out.data[10], rec.Currency(), 4);
+			FlatVector::GetData<string_t>(out.data[11])[n] = duckdb_dbn::EmitCstr(out.data[11], rec.SettlCurrency(), 4);
+			FlatVector::GetData<string_t>(out.data[12])[n] = duckdb_dbn::EmitCstr(out.data[12], rec.SecSubType(), 6);
+			FlatVector::GetData<string_t>(out.data[13])[n] = duckdb_dbn::EmitCstr(out.data[13], rec.Group(), 21);
+			FlatVector::GetData<string_t>(out.data[14])[n] = duckdb_dbn::EmitCstr(out.data[14], rec.Underlying(), 21);
+			FlatVector::GetData<string_t>(out.data[15])[n] = duckdb_dbn::EmitCstr(out.data[15], rec.StrikePriceCurrency(), 4);
+			FlatVector::GetData<string_t>(out.data[16])[n] = duckdb_dbn::EmitCstr(out.data[16], rec.UnitOfMeasure(), 31);
+			FlatVector::GetData<int64_t>(out.data[17])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count());
+			FlatVector::GetData<int64_t>(out.data[18])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count());
+			FlatVector::GetData<double>(out.data[19])[n] = static_cast<double>(rec.min_price_increment) * 1e-9;
+			FlatVector::GetData<double>(out.data[20])[n] = static_cast<double>(rec.display_factor) * 1e-9;
+			FlatVector::GetData<double>(out.data[21])[n] = static_cast<double>(rec.high_limit_price) * 1e-9;
+			FlatVector::GetData<double>(out.data[22])[n] = static_cast<double>(rec.low_limit_price) * 1e-9;
+			FlatVector::GetData<double>(out.data[23])[n] = static_cast<double>(rec.max_price_variation) * 1e-9;
+			FlatVector::GetData<double>(out.data[24])[n] = static_cast<double>(rec.strike_price) * 1e-9;
+			FlatVector::GetData<double>(out.data[25])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9;
+			FlatVector::GetData<double>(out.data[26])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9;
+			FlatVector::GetData<double>(out.data[27])[n] = static_cast<double>(rec.price_ratio) * 1e-9;
+			FlatVector::GetData<uint64_t>(out.data[28])[n] = rec.raw_instrument_id;
+			FlatVector::GetData<uint32_t>(out.data[29])[n] = rec.underlying_id;
+			FlatVector::GetData<int32_t>(out.data[30])[n] = rec.inst_attrib_value;
+			FlatVector::GetData<int32_t>(out.data[31])[n] = rec.market_depth_implied;
+			FlatVector::GetData<int32_t>(out.data[32])[n] = rec.market_depth;
+			FlatVector::GetData<uint32_t>(out.data[33])[n] = rec.market_segment_id;
+			FlatVector::GetData<uint32_t>(out.data[34])[n] = rec.max_trade_vol;
+			FlatVector::GetData<int32_t>(out.data[35])[n] = rec.min_lot_size;
+			FlatVector::GetData<int32_t>(out.data[36])[n] = rec.min_lot_size_block;
+			FlatVector::GetData<int32_t>(out.data[37])[n] = rec.min_lot_size_round_lot;
+			FlatVector::GetData<uint32_t>(out.data[38])[n] = rec.min_trade_vol;
+			FlatVector::GetData<int32_t>(out.data[39])[n] = rec.contract_multiplier;
+			FlatVector::GetData<int32_t>(out.data[40])[n] = rec.decay_quantity;
+			FlatVector::GetData<int32_t>(out.data[41])[n] = rec.original_contract_size;
+			FlatVector::GetData<int16_t>(out.data[42])[n] = rec.appl_id;
+			FlatVector::GetData<uint16_t>(out.data[43])[n] = rec.maturity_year;
+			FlatVector::GetData<uint16_t>(out.data[44])[n] = rec.decay_start_date;
+			FlatVector::GetData<uint16_t>(out.data[45])[n] = rec.channel_id;
+			FlatVector::GetData<string_t>(out.data[46])[n] = duckdb_dbn::EmitChar1(out.data[46], static_cast<char>(rec.match_algorithm));
+			FlatVector::GetData<uint8_t>(out.data[47])[n] = rec.main_fraction;
+			FlatVector::GetData<uint8_t>(out.data[48])[n] = rec.price_display_format;
+			FlatVector::GetData<uint8_t>(out.data[49])[n] = rec.sub_fraction;
+			FlatVector::GetData<uint8_t>(out.data[50])[n] = rec.underlying_product;
+			FlatVector::GetData<string_t>(out.data[51])[n] = duckdb_dbn::EmitChar1(out.data[51], static_cast<char>(rec.security_update_action));
+			FlatVector::GetData<uint8_t>(out.data[52])[n] = rec.maturity_month;
+			FlatVector::GetData<uint8_t>(out.data[53])[n] = rec.maturity_day;
+			FlatVector::GetData<uint8_t>(out.data[54])[n] = rec.maturity_week;
+			FlatVector::GetData<string_t>(out.data[55])[n] = duckdb_dbn::EmitChar1(out.data[55], static_cast<char>(rec.user_defined_instrument));
+			FlatVector::GetData<int8_t>(out.data[56])[n] = static_cast<int8_t>(rec.contract_multiplier_unit);
+			FlatVector::GetData<int8_t>(out.data[57])[n] = static_cast<int8_t>(rec.flow_schedule_type);
+			FlatVector::GetData<uint8_t>(out.data[58])[n] = rec.tick_rule;
+			FlatVector::GetData<uint16_t>(out.data[59])[n] = rec.leg_count;
+			FlatVector::GetData<uint16_t>(out.data[60])[n] = rec.leg_index;
+			FlatVector::GetData<uint32_t>(out.data[61])[n] = rec.leg_instrument_id;
+			FlatVector::GetData<string_t>(out.data[62])[n] = duckdb_dbn::EmitCstr(out.data[62], rec.LegRawSymbol(), 64);
+			FlatVector::GetData<string_t>(out.data[63])[n] = duckdb_dbn::EmitChar1(out.data[63], static_cast<char>(rec.leg_instrument_class));
+			FlatVector::GetData<string_t>(out.data[64])[n] = duckdb_dbn::EmitChar1(out.data[64], static_cast<char>(rec.leg_side));
+			FlatVector::GetData<double>(out.data[65])[n] = static_cast<double>(rec.leg_price) * 1e-9;
+			FlatVector::GetData<double>(out.data[66])[n] = static_cast<double>(rec.leg_delta) * 1e-9;
+			FlatVector::GetData<int32_t>(out.data[67])[n] = rec.leg_ratio_price_numerator;
+			FlatVector::GetData<int32_t>(out.data[68])[n] = rec.leg_ratio_price_denominator;
+			FlatVector::GetData<int32_t>(out.data[69])[n] = rec.leg_ratio_qty_numerator;
+			FlatVector::GetData<int32_t>(out.data[70])[n] = rec.leg_ratio_qty_denominator;
+			FlatVector::GetData<uint32_t>(out.data[71])[n] = rec.leg_underlying_id;
+			FlatVector::Validity(out.data[72]).SetInvalid(n);
+			FlatVector::Validity(out.data[73]).SetInvalid(n);
+			FlatVector::Validity(out.data[74]).SetInvalid(n);
+			FlatVector::Validity(out.data[75]).SetInvalid(n);
+			++n;
+		}
+	} else if (version == 2) {
+		databento::v2::InstrumentDefMsg rec {};
+		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::InstrumentDef)) {
+			FlatVector::GetData<int64_t>(out.data[0])[n] = static_cast<int64_t>((rec.hd.ts_event).time_since_epoch().count());
+			FlatVector::GetData<int64_t>(out.data[1])[n] = static_cast<int64_t>((rec.ts_recv).time_since_epoch().count());
+			FlatVector::GetData<uint32_t>(out.data[2])[n] = rec.hd.instrument_id;
+			FlatVector::GetData<uint16_t>(out.data[3])[n] = rec.hd.publisher_id;
+			FlatVector::GetData<string_t>(out.data[4])[n] = duckdb_dbn::EmitCstr(out.data[4], rec.RawSymbol(), 64);
+			FlatVector::GetData<string_t>(out.data[5])[n] = duckdb_dbn::EmitChar1(out.data[5], static_cast<char>(rec.instrument_class));
+			FlatVector::GetData<string_t>(out.data[6])[n] = duckdb_dbn::EmitCstr(out.data[6], rec.SecurityType(), 7);
+			FlatVector::GetData<string_t>(out.data[7])[n] = duckdb_dbn::EmitCstr(out.data[7], rec.Exchange(), 5);
+			FlatVector::GetData<string_t>(out.data[8])[n] = duckdb_dbn::EmitCstr(out.data[8], rec.Asset(), 11);
+			FlatVector::GetData<string_t>(out.data[9])[n] = duckdb_dbn::EmitCstr(out.data[9], rec.Cfi(), 7);
+			FlatVector::GetData<string_t>(out.data[10])[n] = duckdb_dbn::EmitCstr(out.data[10], rec.Currency(), 4);
+			FlatVector::GetData<string_t>(out.data[11])[n] = duckdb_dbn::EmitCstr(out.data[11], rec.SettlCurrency(), 4);
+			FlatVector::GetData<string_t>(out.data[12])[n] = duckdb_dbn::EmitCstr(out.data[12], rec.SecSubType(), 6);
+			FlatVector::GetData<string_t>(out.data[13])[n] = duckdb_dbn::EmitCstr(out.data[13], rec.Group(), 21);
+			FlatVector::GetData<string_t>(out.data[14])[n] = duckdb_dbn::EmitCstr(out.data[14], rec.Underlying(), 21);
+			FlatVector::GetData<string_t>(out.data[15])[n] = duckdb_dbn::EmitCstr(out.data[15], rec.StrikePriceCurrency(), 4);
+			FlatVector::GetData<string_t>(out.data[16])[n] = duckdb_dbn::EmitCstr(out.data[16], rec.UnitOfMeasure(), 31);
+			FlatVector::GetData<int64_t>(out.data[17])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count());
+			FlatVector::GetData<int64_t>(out.data[18])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count());
+			FlatVector::GetData<double>(out.data[19])[n] = static_cast<double>(rec.min_price_increment) * 1e-9;
+			FlatVector::GetData<double>(out.data[20])[n] = static_cast<double>(rec.display_factor) * 1e-9;
+			FlatVector::GetData<double>(out.data[21])[n] = static_cast<double>(rec.high_limit_price) * 1e-9;
+			FlatVector::GetData<double>(out.data[22])[n] = static_cast<double>(rec.low_limit_price) * 1e-9;
+			FlatVector::GetData<double>(out.data[23])[n] = static_cast<double>(rec.max_price_variation) * 1e-9;
+			FlatVector::GetData<double>(out.data[24])[n] = static_cast<double>(rec.strike_price) * 1e-9;
+			FlatVector::GetData<double>(out.data[25])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9;
+			FlatVector::GetData<double>(out.data[26])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9;
+			FlatVector::GetData<double>(out.data[27])[n] = static_cast<double>(rec.price_ratio) * 1e-9;
+			FlatVector::GetData<uint64_t>(out.data[28])[n] = static_cast<uint64_t>(rec.raw_instrument_id);
+			FlatVector::GetData<uint32_t>(out.data[29])[n] = rec.underlying_id;
+			FlatVector::GetData<int32_t>(out.data[30])[n] = rec.inst_attrib_value;
+			FlatVector::GetData<int32_t>(out.data[31])[n] = rec.market_depth_implied;
+			FlatVector::GetData<int32_t>(out.data[32])[n] = rec.market_depth;
+			FlatVector::GetData<uint32_t>(out.data[33])[n] = rec.market_segment_id;
+			FlatVector::GetData<uint32_t>(out.data[34])[n] = rec.max_trade_vol;
+			FlatVector::GetData<int32_t>(out.data[35])[n] = rec.min_lot_size;
+			FlatVector::GetData<int32_t>(out.data[36])[n] = rec.min_lot_size_block;
+			FlatVector::GetData<int32_t>(out.data[37])[n] = rec.min_lot_size_round_lot;
+			FlatVector::GetData<uint32_t>(out.data[38])[n] = rec.min_trade_vol;
+			FlatVector::GetData<int32_t>(out.data[39])[n] = rec.contract_multiplier;
+			FlatVector::GetData<int32_t>(out.data[40])[n] = rec.decay_quantity;
+			FlatVector::GetData<int32_t>(out.data[41])[n] = rec.original_contract_size;
+			FlatVector::GetData<int16_t>(out.data[42])[n] = rec.appl_id;
+			FlatVector::GetData<uint16_t>(out.data[43])[n] = rec.maturity_year;
+			FlatVector::GetData<uint16_t>(out.data[44])[n] = rec.decay_start_date;
+			FlatVector::GetData<uint16_t>(out.data[45])[n] = rec.channel_id;
+			FlatVector::GetData<string_t>(out.data[46])[n] = duckdb_dbn::EmitChar1(out.data[46], static_cast<char>(rec.match_algorithm));
+			FlatVector::GetData<uint8_t>(out.data[47])[n] = rec.main_fraction;
+			FlatVector::GetData<uint8_t>(out.data[48])[n] = rec.price_display_format;
+			FlatVector::GetData<uint8_t>(out.data[49])[n] = rec.sub_fraction;
+			FlatVector::GetData<uint8_t>(out.data[50])[n] = rec.underlying_product;
+			FlatVector::GetData<string_t>(out.data[51])[n] = duckdb_dbn::EmitChar1(out.data[51], static_cast<char>(rec.security_update_action));
+			FlatVector::GetData<uint8_t>(out.data[52])[n] = rec.maturity_month;
+			FlatVector::GetData<uint8_t>(out.data[53])[n] = rec.maturity_day;
+			FlatVector::GetData<uint8_t>(out.data[54])[n] = rec.maturity_week;
+			FlatVector::GetData<string_t>(out.data[55])[n] = duckdb_dbn::EmitChar1(out.data[55], static_cast<char>(rec.user_defined_instrument));
+			FlatVector::GetData<int8_t>(out.data[56])[n] = static_cast<int8_t>(rec.contract_multiplier_unit);
+			FlatVector::GetData<int8_t>(out.data[57])[n] = static_cast<int8_t>(rec.flow_schedule_type);
+			FlatVector::GetData<uint8_t>(out.data[58])[n] = rec.tick_rule;
+			FlatVector::Validity(out.data[59]).SetInvalid(n);
+			FlatVector::Validity(out.data[60]).SetInvalid(n);
+			FlatVector::Validity(out.data[61]).SetInvalid(n);
+			FlatVector::Validity(out.data[62]).SetInvalid(n);
+			FlatVector::Validity(out.data[63]).SetInvalid(n);
+			FlatVector::Validity(out.data[64]).SetInvalid(n);
+			FlatVector::Validity(out.data[65]).SetInvalid(n);
+			FlatVector::Validity(out.data[66]).SetInvalid(n);
+			FlatVector::Validity(out.data[67]).SetInvalid(n);
+			FlatVector::Validity(out.data[68]).SetInvalid(n);
+			FlatVector::Validity(out.data[69]).SetInvalid(n);
+			FlatVector::Validity(out.data[70]).SetInvalid(n);
+			FlatVector::Validity(out.data[71]).SetInvalid(n);
+			FlatVector::GetData<double>(out.data[72])[n] = static_cast<double>(rec.trading_reference_price) * 1e-9;
+			FlatVector::GetData<uint16_t>(out.data[73])[n] = rec.trading_reference_date;
+			FlatVector::GetData<uint8_t>(out.data[74])[n] = rec.md_security_trading_status;
+			FlatVector::GetData<uint8_t>(out.data[75])[n] = rec.settl_price_type;
+			++n;
+		}
+	} else {
+		databento::v1::InstrumentDefMsg rec {};
+		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::InstrumentDef)) {
+			FlatVector::GetData<int64_t>(out.data[0])[n] = static_cast<int64_t>((rec.hd.ts_event).time_since_epoch().count());
+			FlatVector::GetData<int64_t>(out.data[1])[n] = static_cast<int64_t>((rec.ts_recv).time_since_epoch().count());
+			FlatVector::GetData<uint32_t>(out.data[2])[n] = rec.hd.instrument_id;
+			FlatVector::GetData<uint16_t>(out.data[3])[n] = rec.hd.publisher_id;
+			FlatVector::GetData<string_t>(out.data[4])[n] = duckdb_dbn::EmitCstr(out.data[4], rec.RawSymbol(), 64);
+			FlatVector::GetData<string_t>(out.data[5])[n] = duckdb_dbn::EmitChar1(out.data[5], static_cast<char>(rec.instrument_class));
+			FlatVector::GetData<string_t>(out.data[6])[n] = duckdb_dbn::EmitCstr(out.data[6], rec.SecurityType(), 7);
+			FlatVector::GetData<string_t>(out.data[7])[n] = duckdb_dbn::EmitCstr(out.data[7], rec.Exchange(), 5);
+			FlatVector::GetData<string_t>(out.data[8])[n] = duckdb_dbn::EmitCstr(out.data[8], rec.Asset(), 11);
+			FlatVector::GetData<string_t>(out.data[9])[n] = duckdb_dbn::EmitCstr(out.data[9], rec.Cfi(), 7);
+			FlatVector::GetData<string_t>(out.data[10])[n] = duckdb_dbn::EmitCstr(out.data[10], rec.Currency(), 4);
+			FlatVector::GetData<string_t>(out.data[11])[n] = duckdb_dbn::EmitCstr(out.data[11], rec.SettlCurrency(), 4);
+			FlatVector::GetData<string_t>(out.data[12])[n] = duckdb_dbn::EmitCstr(out.data[12], rec.SecSubType(), 6);
+			FlatVector::GetData<string_t>(out.data[13])[n] = duckdb_dbn::EmitCstr(out.data[13], rec.Group(), 21);
+			FlatVector::GetData<string_t>(out.data[14])[n] = duckdb_dbn::EmitCstr(out.data[14], rec.Underlying(), 21);
+			FlatVector::GetData<string_t>(out.data[15])[n] = duckdb_dbn::EmitCstr(out.data[15], rec.StrikePriceCurrency(), 4);
+			FlatVector::GetData<string_t>(out.data[16])[n] = duckdb_dbn::EmitCstr(out.data[16], rec.UnitOfMeasure(), 31);
+			FlatVector::GetData<int64_t>(out.data[17])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count());
+			FlatVector::GetData<int64_t>(out.data[18])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count());
+			FlatVector::GetData<double>(out.data[19])[n] = static_cast<double>(rec.min_price_increment) * 1e-9;
+			FlatVector::GetData<double>(out.data[20])[n] = static_cast<double>(rec.display_factor) * 1e-9;
+			FlatVector::GetData<double>(out.data[21])[n] = static_cast<double>(rec.high_limit_price) * 1e-9;
+			FlatVector::GetData<double>(out.data[22])[n] = static_cast<double>(rec.low_limit_price) * 1e-9;
+			FlatVector::GetData<double>(out.data[23])[n] = static_cast<double>(rec.max_price_variation) * 1e-9;
+			FlatVector::GetData<double>(out.data[24])[n] = static_cast<double>(rec.strike_price) * 1e-9;
+			FlatVector::GetData<double>(out.data[25])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9;
+			FlatVector::GetData<double>(out.data[26])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9;
+			FlatVector::GetData<double>(out.data[27])[n] = static_cast<double>(rec.price_ratio) * 1e-9;
+			FlatVector::GetData<uint64_t>(out.data[28])[n] = static_cast<uint64_t>(rec.raw_instrument_id);
+			FlatVector::GetData<uint32_t>(out.data[29])[n] = rec.underlying_id;
+			FlatVector::GetData<int32_t>(out.data[30])[n] = rec.inst_attrib_value;
+			FlatVector::GetData<int32_t>(out.data[31])[n] = rec.market_depth_implied;
+			FlatVector::GetData<int32_t>(out.data[32])[n] = rec.market_depth;
+			FlatVector::GetData<uint32_t>(out.data[33])[n] = rec.market_segment_id;
+			FlatVector::GetData<uint32_t>(out.data[34])[n] = rec.max_trade_vol;
+			FlatVector::GetData<int32_t>(out.data[35])[n] = rec.min_lot_size;
+			FlatVector::GetData<int32_t>(out.data[36])[n] = rec.min_lot_size_block;
+			FlatVector::GetData<int32_t>(out.data[37])[n] = rec.min_lot_size_round_lot;
+			FlatVector::GetData<uint32_t>(out.data[38])[n] = rec.min_trade_vol;
+			FlatVector::GetData<int32_t>(out.data[39])[n] = rec.contract_multiplier;
+			FlatVector::GetData<int32_t>(out.data[40])[n] = rec.decay_quantity;
+			FlatVector::GetData<int32_t>(out.data[41])[n] = rec.original_contract_size;
+			FlatVector::GetData<int16_t>(out.data[42])[n] = rec.appl_id;
+			FlatVector::GetData<uint16_t>(out.data[43])[n] = rec.maturity_year;
+			FlatVector::GetData<uint16_t>(out.data[44])[n] = rec.decay_start_date;
+			FlatVector::GetData<uint16_t>(out.data[45])[n] = rec.channel_id;
+			FlatVector::GetData<string_t>(out.data[46])[n] = duckdb_dbn::EmitChar1(out.data[46], static_cast<char>(rec.match_algorithm));
+			FlatVector::GetData<uint8_t>(out.data[47])[n] = rec.main_fraction;
+			FlatVector::GetData<uint8_t>(out.data[48])[n] = rec.price_display_format;
+			FlatVector::GetData<uint8_t>(out.data[49])[n] = rec.sub_fraction;
+			FlatVector::GetData<uint8_t>(out.data[50])[n] = rec.underlying_product;
+			FlatVector::GetData<string_t>(out.data[51])[n] = duckdb_dbn::EmitChar1(out.data[51], static_cast<char>(rec.security_update_action));
+			FlatVector::GetData<uint8_t>(out.data[52])[n] = rec.maturity_month;
+			FlatVector::GetData<uint8_t>(out.data[53])[n] = rec.maturity_day;
+			FlatVector::GetData<uint8_t>(out.data[54])[n] = rec.maturity_week;
+			FlatVector::GetData<string_t>(out.data[55])[n] = duckdb_dbn::EmitChar1(out.data[55], static_cast<char>(rec.user_defined_instrument));
+			FlatVector::GetData<int8_t>(out.data[56])[n] = static_cast<int8_t>(rec.contract_multiplier_unit);
+			FlatVector::GetData<int8_t>(out.data[57])[n] = static_cast<int8_t>(rec.flow_schedule_type);
+			FlatVector::GetData<uint8_t>(out.data[58])[n] = rec.tick_rule;
+			FlatVector::Validity(out.data[59]).SetInvalid(n);
+			FlatVector::Validity(out.data[60]).SetInvalid(n);
+			FlatVector::Validity(out.data[61]).SetInvalid(n);
+			FlatVector::Validity(out.data[62]).SetInvalid(n);
+			FlatVector::Validity(out.data[63]).SetInvalid(n);
+			FlatVector::Validity(out.data[64]).SetInvalid(n);
+			FlatVector::Validity(out.data[65]).SetInvalid(n);
+			FlatVector::Validity(out.data[66]).SetInvalid(n);
+			FlatVector::Validity(out.data[67]).SetInvalid(n);
+			FlatVector::Validity(out.data[68]).SetInvalid(n);
+			FlatVector::Validity(out.data[69]).SetInvalid(n);
+			FlatVector::Validity(out.data[70]).SetInvalid(n);
+			FlatVector::Validity(out.data[71]).SetInvalid(n);
+			FlatVector::GetData<double>(out.data[72])[n] = static_cast<double>(rec.trading_reference_price) * 1e-9;
+			FlatVector::GetData<uint16_t>(out.data[73])[n] = rec.trading_reference_date;
+			FlatVector::GetData<uint8_t>(out.data[74])[n] = rec.md_security_trading_status;
+			FlatVector::GetData<uint8_t>(out.data[75])[n] = rec.settl_price_type;
+			++n;
+		}
+	}
+	out.SetCardinality(n);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Polymorphic read_dbn(path) — probes metadata.schema at bind time and
 // dispatches to the right per-schema bind/scan pair.
 // ════════════════════════════════════════════════════════════════════════════
@@ -819,6 +1248,14 @@ static const SchemaHandler *LookupSchemaHandler(databento::Schema s) {
 		static const SchemaHandler h = {"imbalance", ImbalanceBind, ImbalanceScan};
 		return &h;
 	}
+	case databento::Schema::Statistics: {
+		static const SchemaHandler h = {"statistics", StatisticsBind, StatisticsScan};
+		return &h;
+	}
+	case databento::Schema::Definition: {
+		static const SchemaHandler h = {"definition", DefinitionBind, DefinitionScan};
+		return &h;
+	}
 	case databento::Schema::Cbbo1M: {
 		static const SchemaHandler h = {"cbbo-1m", CbboBind, Cbbo1mScan};
 		return &h;
@@ -886,25 +1323,26 @@ struct ReadDbnBindDataPolymorphic : public ReadDbnBindData {
 
 static unique_ptr<FunctionData> ReadDbnBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<string> &names) {
-	const auto path = GetFilePathArg(input);
-	duckdb_dbn::DbnFileReader probe(path);
+	const auto pattern = GetFilePathArg(input);
+	auto paths = ExpandPaths(context, pattern);
+	duckdb_dbn::DbnFileReader probe(paths.front());
 	const auto &md = probe.GetMetadata();
 	if (!md.schema.has_value()) {
 		throw InvalidInputException("dbn: file '%s' has no schema in metadata (mixed-schema file); "
 		                            "polymorphic read_dbn() can't dispatch — use a specific "
 		                            "read_dbn_<schema>() function instead.",
-		                            path);
+		                            paths.front());
 	}
 	const auto *handler = LookupSchemaHandler(*md.schema);
 	if (handler == nullptr) {
 		throw InvalidInputException(
-		    "dbn: schema '%s' is not yet supported by polymorphic read_dbn() (definition / statistics need "
-		    "version-aware decoding; cbbo-1m / ohlcv-eod are not yet wired). File: '%s'.",
-		    SchemaToCstr(*md.schema), path);
+		    "dbn: file '%s' has schema '%s', which the polymorphic read_dbn() dispatcher "
+		    "does not yet recognize. File a bug.",
+		    paths.front(), SchemaToCstr(*md.schema));
 	}
 	(void)handler->bind(context, input, return_types, names);
 	auto bd = make_uniq<ReadDbnBindDataPolymorphic>();
-	bd->file_path = path;
+	bd->file_paths = std::move(paths);
 	bd->dispatched_scan = handler->scan;
 	return std::move(bd);
 }
@@ -983,6 +1421,83 @@ static void DbnMetadataScan(ClientContext &, TableFunctionInput &input, DataChun
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// dbn_records(path) — raw rtype-agnostic view, for mixed-schema files where
+// metadata.schema is NULL (system messages mixed with data records, etc.).
+// Single-file (no glob). Emits header fields + record body as BLOB.
+// ════════════════════════════════════════════════════════════════════════════
+
+struct DbnRecordsBindData : public TableFunctionData {
+	std::string file_path;
+};
+
+struct DbnRecordsGlobalState : public GlobalTableFunctionState {
+	explicit DbnRecordsGlobalState(const std::string &path)
+	    : reader(std::make_unique<duckdb_dbn::DbnFileReader>(path)) {}
+	std::unique_ptr<duckdb_dbn::DbnFileReader> reader;
+};
+
+static unique_ptr<FunctionData> DbnRecordsBind(ClientContext &, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	auto bd = make_uniq<DbnRecordsBindData>();
+	bd->file_path = GetFilePathArg(input);
+	names = {"ts_event", "rtype", "length", "publisher_id", "instrument_id", "body"};
+	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::UTINYINT,  LogicalType::UTINYINT,
+	                LogicalType::USMALLINT,    LogicalType::UINTEGER,  LogicalType::BLOB};
+	return std::move(bd);
+}
+
+static unique_ptr<GlobalTableFunctionState> DbnRecordsInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+	auto &bd = input.bind_data->Cast<DbnRecordsBindData>();
+	return make_uniq<DbnRecordsGlobalState>(bd.file_path);
+}
+
+static void DbnRecordsScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
+	auto &st = input.global_state->Cast<DbnRecordsGlobalState>();
+	auto ts_event_v = FlatVector::GetData<int64_t>(out.data[0]);
+	auto rtype_v = FlatVector::GetData<uint8_t>(out.data[1]);
+	auto length_v = FlatVector::GetData<uint8_t>(out.data[2]);
+	auto pub_v = FlatVector::GetData<uint16_t>(out.data[3]);
+	auto instr_v = FlatVector::GetData<uint32_t>(out.data[4]);
+	auto body_v = FlatVector::GetData<string_t>(out.data[5]);
+
+	alignas(8) std::byte buf[duckdb_dbn::DbnFileReader::kMaxRecordLen];
+	databento::RecordHeader hdr {};
+	std::size_t rec_len = 0;
+	idx_t n = 0;
+	while (n < STANDARD_VECTOR_SIZE && st.reader->NextRecordRaw(buf, &hdr, &rec_len, nullptr)) {
+		ts_event_v[n] = static_cast<int64_t>(hdr.ts_event.time_since_epoch().count());
+		rtype_v[n] = static_cast<uint8_t>(hdr.rtype);
+		length_v[n] = hdr.length;
+		pub_v[n] = hdr.publisher_id;
+		instr_v[n] = hdr.instrument_id;
+		body_v[n] = StringVector::AddStringOrBlob(out.data[5], reinterpret_cast<const char *>(buf), rec_len);
+		++n;
+	}
+	out.SetCardinality(n);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Replacement scan — `SELECT * FROM 'foo.dbn'` rewrites to read_dbn('foo.dbn').
+// `.dbn.zst` is NOT matched here: DuckDB's built-in parse-time path intercepts
+// any `.zst` suffix and routes it through the parquet extension before any
+// replacement scan runs. For compressed files, call read_dbn('foo.dbn.zst')
+// directly — Phase 3-B's ZstdInput handles decompression transparently.
+// ════════════════════════════════════════════════════════════════════════════
+
+static unique_ptr<TableRef> ReadDbnReplacement(ClientContext &, ReplacementScanInput &input,
+                                               optional_ptr<ReplacementScanData>) {
+	auto table_name = ReplacementScan::GetFullPath(input);
+	if (!StringUtil::EndsWith(table_name, ".dbn")) {
+		return nullptr;
+	}
+	auto fn = make_uniq<TableFunctionRef>();
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(make_uniq<ConstantExpression>(Value(table_name)));
+	fn->function = make_uniq<FunctionExpression>("read_dbn", std::move(children));
+	return std::move(fn);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Registration
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1008,12 +1523,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	Register(loader, "read_dbn_ohlcv_1d", OhlcvBind, Ohlcv1dScan);
 	Register(loader, "read_dbn_status", StatusBind, StatusScan);
 	Register(loader, "read_dbn_imbalance", ImbalanceBind, ImbalanceScan);
+	Register(loader, "read_dbn_statistics", StatisticsBind, StatisticsScan);
+	Register(loader, "read_dbn_definition", DefinitionBind, DefinitionScan);
 	Register(loader, "read_dbn_cbbo_1m", CbboBind, Cbbo1mScan);
 	Register(loader, "read_dbn_ohlcv_eod", OhlcvBind, OhlcvEodScan);
 	Register(loader, "read_dbn_tcbbo", Cmbp1Bind, TcbboScan);
 
 	TableFunction mf("dbn_metadata", {LogicalType::VARCHAR}, DbnMetadataScan, DbnMetadataBind, DbnMetadataInitGlobal);
 	loader.RegisterFunction(mf);
+
+	TableFunction rf("dbn_records", {LogicalType::VARCHAR}, DbnRecordsScan, DbnRecordsBind, DbnRecordsInitGlobal);
+	loader.RegisterFunction(rf);
+
+	DBConfig::GetConfig(loader.GetDatabaseInstance()).replacement_scans.emplace_back(ReadDbnReplacement);
 }
 
 void DbnExtension::Load(ExtensionLoader &loader) {

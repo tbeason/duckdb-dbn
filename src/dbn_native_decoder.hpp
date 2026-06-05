@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "databento/enums.hpp"
 #include "databento/record.hpp"
@@ -45,15 +46,20 @@ public:
 	static constexpr std::size_t kMaxRecordLen = 528;
 
 	explicit DbnFileReader(const std::string &path);
+	// Multi-file constructor — used for glob inputs. The reader iterates the
+	// files in order, transparently advancing across file boundaries inside
+	// NextRecordRaw. All files must share schema, version, and ts_out — any
+	// mismatch from the first file's metadata throws on open.
+	explicit DbnFileReader(std::vector<std::string> paths);
 
 	const DbnMetadata &GetMetadata() const {
-		return metadata_;
+		return first_metadata_;
 	}
 	std::uint8_t Version() const {
-		return metadata_.version;
+		return first_metadata_.version;
 	}
 	bool HasTsOut() const {
-		return metadata_.ts_out;
+		return first_metadata_.ts_out;
 	}
 
 	bool NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
@@ -83,8 +89,15 @@ public:
 	}
 
 private:
+	void OpenAndParseFile(const std::string &path);
+	bool AdvanceToNextFile();
+
 	std::unique_ptr<IDbnInput> input_;
-	DbnMetadata metadata_;
+	DbnMetadata metadata_;       // current file's metadata
+	DbnMetadata first_metadata_; // first file's metadata (for GetMetadata)
+	std::vector<std::string> remaining_paths_;
+	std::string current_path_;
+	bool first_opened_ = false;
 };
 
 } // namespace duckdb_dbn

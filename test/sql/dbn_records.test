@@ -1,0 +1,60 @@
+# name: test/sql/dbn_records.test
+# description: dbn_records() raw rtype-agnostic view
+# group: [sql]
+
+statement error
+SELECT * FROM dbn_records('test/data/test_data.trades.dbn');
+----
+dbn_records
+
+require dbn
+
+# Same row count as read_dbn_trades (which filters by rtype). For a clean
+# trades file the two match.
+query I
+SELECT count(*) FROM dbn_records('test/data/test_data.trades.dbn');
+----
+2
+
+# All records in the trades file have rtype = Mbp0 = 0.
+query I
+SELECT count(DISTINCT rtype) FROM dbn_records('test/data/test_data.trades.dbn');
+----
+1
+
+query I
+SELECT rtype FROM dbn_records('test/data/test_data.trades.dbn') LIMIT 1;
+----
+0
+
+# Body BLOB length is record_bytes = length × 4 = 12 × 4 = 48 bytes for a
+# TradeMsg.
+query I
+SELECT octet_length(body) FROM dbn_records('test/data/test_data.trades.dbn') LIMIT 1;
+----
+48
+
+# Column types
+query IIIIII
+SELECT
+    typeof(ts_event),
+    typeof(rtype),
+    typeof(length),
+    typeof(publisher_id),
+    typeof(instrument_id),
+    typeof(body)
+FROM dbn_records('test/data/test_data.trades.dbn') LIMIT 1;
+----
+TIMESTAMP_NS	UTINYINT	UTINYINT	USMALLINT	UINTEGER	BLOB
+
+# Header fields agree with the typed reader.
+query IIII
+SELECT
+    epoch_ns(ts_event),
+    instrument_id::BIGINT,
+    publisher_id::BIGINT,
+    length::BIGINT
+FROM dbn_records('test/data/test_data.trades.dbn')
+ORDER BY ts_event LIMIT 1;
+----
+1609160400098821953	5482	1	12

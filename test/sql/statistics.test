@@ -1,0 +1,43 @@
+# name: test/sql/statistics.test
+# description: read_dbn_statistics() with version-aware quantity widening
+# group: [sql]
+
+statement error
+SELECT * FROM read_dbn_statistics('test/data/test_data.statistics.dbn');
+----
+read_dbn_statistics
+
+require dbn
+
+# Fixture is DBN v2 (StatMsg = 64 bytes, int32 quantity). The reader detects
+# the version from metadata and reads the v1-layout struct internally,
+# sign-extending quantity to BIGINT.
+query I
+SELECT count(*) FROM read_dbn_statistics('test/data/test_data.statistics.dbn');
+----
+2
+
+# Column types — quantity is always BIGINT regardless of source version
+query III
+SELECT typeof(quantity), typeof(price), typeof(stat_flags)
+FROM read_dbn_statistics('test/data/test_data.statistics.dbn') LIMIT 1;
+----
+BIGINT	DOUBLE	UTINYINT
+
+# Column count matches the bind schema (13 columns)
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_dbn_statistics('test/data/test_data.statistics.dbn'));
+----
+13
+
+# Polymorphic read_dbn() now also dispatches statistics
+query I
+SELECT count(*) FROM read_dbn('test/data/test_data.statistics.dbn');
+----
+2
+
+query I
+SELECT typeof(quantity)
+FROM read_dbn('test/data/test_data.statistics.dbn') LIMIT 1;
+----
+BIGINT

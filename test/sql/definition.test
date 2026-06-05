@@ -1,0 +1,67 @@
+# name: test/sql/definition.test
+# description: read_dbn_definition() with v1/v2/v3 layout handling
+# group: [sql]
+
+statement error
+SELECT * FROM read_dbn_definition('test/data/test_data.definition.dbn');
+----
+read_dbn_definition
+
+require dbn
+
+# v1 fixture — exercises the v1 InstrumentDefMsg path. Most fields populate;
+# the v3-only leg_* and a handful of v3 additions emit as NULL; the four
+# v1/v2 deprecated fields (trading_reference_*, md_security_trading_status,
+# settl_price_type) populate.
+query I
+SELECT count(*) FROM read_dbn_definition('test/data/test_data.definition.dbn');
+----
+2
+
+# Column count = 76
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_dbn_definition('test/data/test_data.definition.dbn'));
+----
+76
+
+# Spot-check column types — sticky points are leg_* + deprecated fields
+query III
+SELECT typeof(raw_symbol), typeof(instrument_class), typeof(leg_count)
+FROM read_dbn_definition('test/data/test_data.definition.dbn') LIMIT 1;
+----
+VARCHAR	VARCHAR	USMALLINT
+
+# v1 source: leg_* NULL, trading_reference_* present
+query II
+SELECT leg_count IS NULL, trading_reference_price IS NOT NULL
+FROM read_dbn_definition('test/data/test_data.definition.dbn') LIMIT 1;
+----
+true	true
+
+# raw_symbol is non-empty
+query I
+SELECT length(raw_symbol) > 0
+FROM read_dbn_definition('test/data/test_data.definition.dbn') LIMIT 1;
+----
+true
+
+# v3 compressed fixture — exercises v3 path + zst input
+query I
+SELECT count(*) > 0
+FROM read_dbn_definition('test/data/test_data.definition.v3.dbn.zst');
+----
+true
+
+# v3 source: leg_* present, deprecated NULL
+query II
+SELECT leg_count IS NOT NULL, trading_reference_price IS NULL
+FROM read_dbn_definition('test/data/test_data.definition.v3.dbn.zst') LIMIT 1;
+----
+true	true
+
+# Polymorphic read_dbn() also dispatches definition now
+query I
+SELECT count(*) > 0
+FROM read_dbn('test/data/test_data.definition.v3.dbn.zst');
+----
+true

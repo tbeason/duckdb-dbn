@@ -14,7 +14,6 @@ namespace duckdb_dbn {
 
 namespace {
 
-// Mirrors databento-cpp/src/dbn_constants.hpp.
 constexpr std::size_t kMagicSize = 4;
 constexpr std::size_t kMetadataPreludeSize = 8;
 constexpr std::uint32_t kZstdMagicNumber = 0xFD2FB528;
@@ -40,7 +39,6 @@ T ReadLE(const std::uint8_t *p) {
 	return v;
 }
 
-// Plain file source.
 class FileInput : public IDbnInput {
 public:
 	explicit FileInput(const std::string &path) : f_(path, std::ios::binary) {
@@ -57,8 +55,6 @@ private:
 	std::ifstream f_;
 };
 
-// Streaming Zstd decompressor over a file. Uses DuckDB's bundled zstd in the
-// `duckdb_zstd::` namespace, so no extra linkage is required.
 class ZstdInput : public IDbnInput {
 public:
 	explicit ZstdInput(const std::string &path) : f_(path, std::ios::binary) {
@@ -96,8 +92,6 @@ public:
 				f_.read(in_buf_.data(), static_cast<std::streamsize>(in_buf_.size()));
 				const auto got = static_cast<std::size_t>(f_.gcount());
 				if (got == 0) {
-					// no more compressed input — return whatever we managed to
-					// decompress this call (may be 0 = clean EOF).
 					return zout.pos;
 				}
 				zin_.size = got;
@@ -108,8 +102,6 @@ public:
 				throw std::runtime_error(std::string("dbn: zstd decompression error: ") +
 				                         duckdb_zstd::ZSTD_getErrorName(ret));
 			}
-			// ret == 0 means end of a frame; subsequent calls will start a new
-			// frame if any. Continue the loop until zout is full or EOF.
 		}
 		return zout.pos;
 	}
@@ -122,7 +114,6 @@ private:
 };
 
 std::unique_ptr<IDbnInput> OpenInput(const std::string &path) {
-	// Peek the first 4 bytes to choose the right input type.
 	std::ifstream peek(path, std::ios::binary);
 	if (!peek) {
 		throw std::runtime_error("dbn: failed to open file: " + path);
@@ -141,10 +132,9 @@ std::unique_ptr<IDbnInput> OpenInput(const std::string &path) {
 	if (std::memcmp(magic.data(), kDbnPrefix, 3) == 0) {
 		return std::make_unique<FileInput>(path);
 	}
-	throw std::runtime_error("dbn: file '" + path + "' is neither a DBN file nor a Zstd-compressed DBN file");
+	throw std::runtime_error("dbn: file is neither a DBN nor a Zstd-compressed DBN: " + path);
 }
 
-// Read exactly `n` bytes from `input`, throwing on short read.
 void ReadExact(IDbnInput &input, void *buf, std::size_t n, const char *what) {
 	const auto got = input.Read(reinterpret_cast<char *>(buf), n);
 	if (got != n) {
@@ -155,18 +145,33 @@ void ReadExact(IDbnInput &input, void *buf, std::size_t n, const char *what) {
 
 } // namespace
 
-DbnFileReader::DbnFileReader(const std::string &path) : input_(OpenInput(path)) {
+DbnFileReader::DbnFileReader(const std::string &path) : DbnFileReader(std::vector<std::string> {path}) {
+}
+
+DbnFileReader::DbnFileReader(std::vector<std::string> paths) {
+	if (paths.empty()) {
+		throw std::runtime_error("dbn: no files to read");
+	}
+	remaining_paths_ = std::move(paths);
+	AdvanceToNextFile();
+}
+
+void DbnFileReader::OpenAndParseFile(const std::string &path) {
+	input_ = OpenInput(path);
+	current_path_ = path;
+
 	std::array<std::uint8_t, kMetadataPreludeSize> prelude {};
 	ReadExact(*input_, prelude.data(), prelude.size(), "metadata prelude");
 
 	if (std::memcmp(prelude.data(), kDbnPrefix, 3) != 0) {
-		throw std::runtime_error("dbn: missing DBN prefix in file header");
+		throw std::runtime_error("dbn: missing DBN prefix in file: " + path);
 	}
-	metadata_.version = prelude[3];
+	DbnMetadata md {};
+	md.version = prelude[3];
 
 	const std::uint32_t frame_size = ReadLE<std::uint32_t>(prelude.data() + kMagicSize);
 	if (frame_size < kFixedMetadataLen) {
-		throw std::runtime_error("dbn: metadata frame shorter than fixed-metadata length");
+		throw std::runtime_error("dbn: metadata frame shorter than fixed-metadata length in: " + path);
 	}
 
 	std::vector<std::uint8_t> meta_buf(frame_size);
@@ -174,70 +179,102 @@ DbnFileReader::DbnFileReader(const std::string &path) : input_(OpenInput(path)) 
 
 	const auto *ds_ptr = reinterpret_cast<const char *>(meta_buf.data());
 	const auto ds_len = ::strnlen(ds_ptr, kDatasetCstrLen);
-	metadata_.dataset.assign(ds_ptr, ds_len);
+	md.dataset.assign(ds_ptr, ds_len);
 
 	const auto raw_schema = ReadLE<std::uint16_t>(meta_buf.data() + kOffSchema);
 	if (raw_schema != kNullSchema) {
-		metadata_.schema = static_cast<databento::Schema>(raw_schema);
+		md.schema = static_cast<databento::Schema>(raw_schema);
 	}
 
-	metadata_.start_ns = static_cast<std::int64_t>(ReadLE<std::uint64_t>(meta_buf.data() + kOffStart));
-	metadata_.end_ns = static_cast<std::int64_t>(ReadLE<std::uint64_t>(meta_buf.data() + kOffEnd));
-	metadata_.limit = ReadLE<std::uint64_t>(meta_buf.data() + kOffLimit);
+	md.start_ns = static_cast<std::int64_t>(ReadLE<std::uint64_t>(meta_buf.data() + kOffStart));
+	md.end_ns = static_cast<std::int64_t>(ReadLE<std::uint64_t>(meta_buf.data() + kOffEnd));
+	md.limit = ReadLE<std::uint64_t>(meta_buf.data() + kOffLimit);
 
-	const std::size_t stype_in_off = (metadata_.version == 1) ? kOffStypeInV1 : kOffStypeInV2;
+	const std::size_t stype_in_off = (md.version == 1) ? kOffStypeInV1 : kOffStypeInV2;
 	const std::uint8_t raw_stype_in = meta_buf[stype_in_off];
 	if (raw_stype_in != kNullSType) {
-		metadata_.stype_in = static_cast<databento::SType>(raw_stype_in);
+		md.stype_in = static_cast<databento::SType>(raw_stype_in);
 	}
-	metadata_.stype_out = static_cast<databento::SType>(meta_buf[stype_in_off + 1]);
-	metadata_.ts_out = (meta_buf[stype_in_off + 2] != 0);
+	md.stype_out = static_cast<databento::SType>(meta_buf[stype_in_off + 1]);
+	md.ts_out = (meta_buf[stype_in_off + 2] != 0);
 
-	if (metadata_.version > 1) {
-		metadata_.symbol_cstr_len = ReadLE<std::uint16_t>(meta_buf.data() + stype_in_off + 3);
+	if (md.version > 1) {
+		md.symbol_cstr_len = ReadLE<std::uint16_t>(meta_buf.data() + stype_in_off + 3);
 	} else {
-		metadata_.symbol_cstr_len = kSymbolCstrLenV1;
+		md.symbol_cstr_len = kSymbolCstrLenV1;
 	}
+
+	if (first_opened_) {
+		if (md.schema != first_metadata_.schema || md.version != first_metadata_.version ||
+		    md.ts_out != first_metadata_.ts_out) {
+			throw std::runtime_error("dbn: multi-file scan requires consistent schema, version, and "
+			                         "ts_out across files; mismatched file: " +
+			                         path);
+		}
+	} else {
+		first_metadata_ = md;
+		first_opened_ = true;
+	}
+	metadata_ = md;
+}
+
+bool DbnFileReader::AdvanceToNextFile() {
+	if (remaining_paths_.empty()) {
+		input_.reset();
+		return false;
+	}
+	auto path = std::move(remaining_paths_.front());
+	remaining_paths_.erase(remaining_paths_.begin());
+	OpenAndParseFile(path);
+	return true;
 }
 
 bool DbnFileReader::NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
                                   std::uint64_t *ts_out_out) {
-	const auto got = input_->Read(reinterpret_cast<char *>(buf), sizeof(databento::RecordHeader));
-	if (got == 0) {
-		return false;
-	}
-	if (got != sizeof(databento::RecordHeader)) {
-		throw std::runtime_error("dbn: truncated record header at end of file");
-	}
-
-	std::memcpy(hdr, buf, sizeof(databento::RecordHeader));
-
-	const std::size_t record_bytes = static_cast<std::size_t>(hdr->length) * kRecordHeaderLengthMultiplier;
-	if (record_bytes < sizeof(databento::RecordHeader)) {
-		throw std::runtime_error("dbn: record length shorter than header");
-	}
-	if (record_bytes > kMaxRecordLen) {
-		throw std::runtime_error("dbn: record exceeds reader buffer (" + std::to_string(record_bytes) + " bytes)");
-	}
-
-	const std::size_t remaining = record_bytes - sizeof(databento::RecordHeader);
-	if (remaining > 0) {
-		ReadExact(*input_, reinterpret_cast<char *>(buf) + sizeof(databento::RecordHeader), remaining, "record body");
-	}
-
-	if (record_len_bytes) {
-		*record_len_bytes = record_bytes;
-	}
-
-	if (metadata_.ts_out) {
-		std::uint64_t trailer = 0;
-		ReadExact(*input_, &trailer, sizeof(trailer), "ts_out trailer");
-		if (ts_out_out) {
-			*ts_out_out = trailer;
+	while (input_) {
+		const auto got = input_->Read(reinterpret_cast<char *>(buf), sizeof(databento::RecordHeader));
+		if (got == 0) {
+			if (!AdvanceToNextFile()) {
+				return false;
+			}
+			continue;
 		}
-	}
+		if (got != sizeof(databento::RecordHeader)) {
+			throw std::runtime_error("dbn: truncated record header in file: " + current_path_);
+		}
 
-	return true;
+		std::memcpy(hdr, buf, sizeof(databento::RecordHeader));
+
+		const std::size_t record_bytes = static_cast<std::size_t>(hdr->length) * kRecordHeaderLengthMultiplier;
+		if (record_bytes < sizeof(databento::RecordHeader)) {
+			throw std::runtime_error("dbn: record length shorter than header in: " + current_path_);
+		}
+		if (record_bytes > kMaxRecordLen) {
+			throw std::runtime_error("dbn: record exceeds reader buffer (" + std::to_string(record_bytes) +
+			                         " bytes) in: " + current_path_);
+		}
+
+		const std::size_t remaining = record_bytes - sizeof(databento::RecordHeader);
+		if (remaining > 0) {
+			ReadExact(*input_, reinterpret_cast<char *>(buf) + sizeof(databento::RecordHeader), remaining,
+			          "record body");
+		}
+
+		if (record_len_bytes) {
+			*record_len_bytes = record_bytes;
+		}
+
+		if (metadata_.ts_out) {
+			std::uint64_t trailer = 0;
+			ReadExact(*input_, &trailer, sizeof(trailer), "ts_out trailer");
+			if (ts_out_out) {
+				*ts_out_out = trailer;
+			}
+		}
+
+		return true;
+	}
+	return false;
 }
 
 } // namespace duckdb_dbn

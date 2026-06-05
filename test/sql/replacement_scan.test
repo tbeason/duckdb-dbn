@@ -1,0 +1,28 @@
+# name: test/sql/replacement_scan.test
+# description: SELECT * FROM '<path>.dbn' replacement scan
+# group: [sql]
+# .dbn.zst is intentionally NOT matched here — DuckDB's built-in machinery
+# intercepts .zst at parse time and routes it via the parquet extension before
+# any replacement scan runs. Use read_dbn('foo.dbn.zst') directly for those.
+
+require dbn
+
+# Uncompressed trades file resolves to read_dbn() polymorphic, which dispatches
+# to the trades reader.
+query I
+SELECT count(*) FROM 'test/data/test_data.trades.dbn';
+----
+2
+
+# Replacement scan returns the same columns as read_dbn() — spot check on MBO
+query II
+SELECT typeof(order_id), typeof(price)
+FROM 'test/data/test_data.mbo.dbn' LIMIT 1;
+----
+UBIGINT	DOUBLE
+
+# Polymorphic dispatch via replacement scan — definition file gets 76 cols
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM 'test/data/test_data.definition.dbn');
+----
+76
