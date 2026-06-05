@@ -1,0 +1,51 @@
+# name: test/sql/imbalance.test
+# description: read_dbn_imbalance() table function
+# group: [sql]
+
+statement error
+SELECT * FROM read_dbn_imbalance('test/data/test_data.imbalance.dbn');
+----
+read_dbn_imbalance
+
+require dbn
+
+query I
+SELECT count(*) FROM read_dbn_imbalance('test/data/test_data.imbalance.dbn');
+----
+2
+
+# Header + reference fields
+query IIIIRIIIIII
+SELECT
+    epoch_ns(ts_event),
+    epoch_ns(ts_recv),
+    instrument_id::BIGINT,
+    publisher_id::BIGINT,
+    ref_price,
+    epoch_ns(auction_time),
+    paired_qty::BIGINT,
+    total_imbalance_qty::BIGINT,
+    market_imbalance_qty::BIGINT,
+    unpaired_qty::BIGINT,
+    auction_status::BIGINT
+FROM read_dbn_imbalance('test/data/test_data.imbalance.dbn')
+ORDER BY ts_event
+LIMIT 2;
+----
+1633353900633854579	1633353900633864350	9439	2	229.43	0	0	2000	0	0	0
+1633353910208114778	1633353910208124734	9439	2	229.99	0	1719	281	0	0	0
+
+# Char-enum fields + side fields
+query TTTTII
+SELECT
+    auction_type,
+    side,
+    unpaired_side,
+    significant_imbalance,
+    freeze_status::BIGINT,
+    num_extensions::BIGINT
+FROM read_dbn_imbalance('test/data/test_data.imbalance.dbn')
+ORDER BY ts_event
+LIMIT 1;
+----
+O	B	N	~	0	0

@@ -1,0 +1,39 @@
+# name: test/sql/bbo_1m.test
+# description: read_dbn_bbo_1m() table function
+# group: [sql]
+
+statement error
+SELECT * FROM read_dbn_bbo_1m('test/data/test_data.bbo-1m.dbn');
+----
+read_dbn_bbo_1m
+
+require dbn
+
+query I
+SELECT count(*) FROM read_dbn_bbo_1m('test/data/test_data.bbo-1m.dbn');
+----
+4
+
+query IIIIRITIRRIIIII
+SELECT
+    epoch_ns(ts_event),
+    epoch_ns(ts_recv),
+    instrument_id::BIGINT,
+    publisher_id::BIGINT,
+    price,
+    size::BIGINT,
+    side,
+    flags::BIGINT,
+    bid_price,
+    ask_price,
+    bid_size::BIGINT,
+    ask_size::BIGINT,
+    bid_ct::BIGINT,
+    ask_ct::BIGINT,
+    sequence::BIGINT
+FROM read_dbn_bbo_1m('test/data/test_data.bbo-1m.dbn')
+ORDER BY ts_event, sequence
+LIMIT 2;
+----
+1609113599045849637	1609113600000000000	5482	1	3702.5	2	A	168	3702.25	3702.75	18	13	10	13	145799
+1609113659578979253	1609113660000000000	5482	1	3704.75	1	B	130	3704.5	3705.0	15	22	10	22	149903

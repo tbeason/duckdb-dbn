@@ -1,0 +1,31 @@
+# name: test/sql/ohlcv_1m.test
+# description: read_dbn_ohlcv_1m() table function (synthetic fixture, 100x scale)
+# group: [sql]
+
+statement error
+SELECT * FROM read_dbn_ohlcv_1m('test/data/test_data.ohlcv-1m.dbn');
+----
+read_dbn_ohlcv_1m
+
+require dbn
+
+query I
+SELECT count(*) FROM read_dbn_ohlcv_1m('test/data/test_data.ohlcv-1m.dbn');
+----
+2
+
+query IIIRRRRI
+SELECT
+    epoch_ns(ts_event),
+    instrument_id::BIGINT,
+    publisher_id::BIGINT,
+    open,
+    high,
+    low,
+    close,
+    volume::BIGINT
+FROM read_dbn_ohlcv_1m('test/data/test_data.ohlcv-1m.dbn')
+ORDER BY ts_event;
+----
+1609160400000000000	5482	1	372025.0	372150.0	372025.0	372100.0	353
+1609160460000000000	5482	1	372100.0	372150.0	372100.0	372150.0	152

@@ -1,0 +1,41 @@
+# name: test/sql/tbbo.test
+# description: read_dbn_tbbo() table function
+# group: [sql]
+# TBBO uses Mbp1Msg + RType::Mbp1. Without metadata-schema parsing
+# read_dbn_tbbo and read_dbn_mbp1 return the same data on either file;
+# Phase 3 will gate them via Metadata.schema.
+
+statement error
+SELECT * FROM read_dbn_tbbo('test/data/test_data.tbbo.dbn');
+----
+read_dbn_tbbo
+
+require dbn
+
+query I
+SELECT count(*) FROM read_dbn_tbbo('test/data/test_data.tbbo.dbn');
+----
+2
+
+query IIIIRRIIIIIIITT
+SELECT
+    epoch_ns(ts_event),
+    epoch_ns(ts_recv),
+    instrument_id::BIGINT,
+    publisher_id::BIGINT,
+    bid_price,
+    ask_price,
+    bid_size::BIGINT,
+    ask_size::BIGINT,
+    bid_ct::BIGINT,
+    ask_ct::BIGINT,
+    flags::BIGINT,
+    ts_in_delta,
+    sequence::BIGINT,
+    action,
+    side
+FROM read_dbn_tbbo('test/data/test_data.tbbo.dbn')
+ORDER BY ts_event, sequence;
+----
+1609160400098821953	1609160400099150057	5482	1	3720.25	3720.5	26	7	16	6	129	19251	1170380	T	A
+1609160400107665963	1609160400108142648	5482	1	3720.25	3720.5	21	22	13	15	129	20728	1170414	T	A

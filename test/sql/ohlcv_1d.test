@@ -1,0 +1,16 @@
+# name: test/sql/ohlcv_1d.test
+# description: read_dbn_ohlcv_1d() table function (fixture has 0 data records)
+# group: [sql]
+
+statement error
+SELECT * FROM read_dbn_ohlcv_1d('test/data/test_data.ohlcv-1d.dbn');
+----
+read_dbn_ohlcv_1d
+
+require dbn
+
+# Shipped daily fixture is metadata-only — reader returns zero rows.
+query I
+SELECT count(*) FROM read_dbn_ohlcv_1d('test/data/test_data.ohlcv-1d.dbn');
+----
+0

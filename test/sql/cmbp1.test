@@ -1,0 +1,39 @@
+# name: test/sql/cmbp1.test
+# description: read_dbn_cmbp1() table function
+# group: [sql]
+
+statement error
+SELECT * FROM read_dbn_cmbp1('test/data/test_data.cmbp-1.dbn');
+----
+read_dbn_cmbp1
+
+require dbn
+
+query I
+SELECT count(*) FROM read_dbn_cmbp1('test/data/test_data.cmbp-1.dbn');
+----
+2
+
+query IIIIRITTIIRRIIII
+SELECT
+    epoch_ns(ts_event),
+    epoch_ns(ts_recv),
+    instrument_id::BIGINT,
+    publisher_id::BIGINT,
+    price,
+    size::BIGINT,
+    action,
+    side,
+    flags::BIGINT,
+    ts_in_delta,
+    bid_price,
+    ask_price,
+    bid_size::BIGINT,
+    ask_size::BIGINT,
+    bid_pb::BIGINT,
+    ask_pb::BIGINT
+FROM read_dbn_cmbp1('test/data/test_data.cmbp-1.dbn')
+ORDER BY ts_event;
+----
+1609160400006001487	1609160400006136329	5482	1	3720.5	1	A	A	128	17214	3720.25	3720.5	24	11	1	1
+1609160400006146661	1609160400006246513	5482	1	3720.5	1	A	A	128	18858	3720.25	3720.5	24	12	1	1

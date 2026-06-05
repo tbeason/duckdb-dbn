@@ -1,0 +1,34 @@
+# name: test/sql/ohlcv_1s.test
+# description: read_dbn_ohlcv_1s() table function
+# group: [sql]
+# Note: the shipped fixtures store OHLCV prices ~100x what ES actually trades
+# at. The raw int64 values are scaled by the standard FixedPriceScale=1e9 per
+# the databento spec, so we emit 372025.0 etc. — synthetic test data.
+
+statement error
+SELECT * FROM read_dbn_ohlcv_1s('test/data/test_data.ohlcv-1s.dbn');
+----
+read_dbn_ohlcv_1s
+
+require dbn
+
+query I
+SELECT count(*) FROM read_dbn_ohlcv_1s('test/data/test_data.ohlcv-1s.dbn');
+----
+2
+
+query IIIRRRRI
+SELECT
+    epoch_ns(ts_event),
+    instrument_id::BIGINT,
+    publisher_id::BIGINT,
+    open,
+    high,
+    low,
+    close,
+    volume::BIGINT
+FROM read_dbn_ohlcv_1s('test/data/test_data.ohlcv-1s.dbn')
+ORDER BY ts_event;
+----
+1609160400000000000	5482	1	372025.0	372050.0	372025.0	372050.0	57
+1609160401000000000	5482	1	372050.0	372050.0	372050.0	372050.0	13

@@ -1,0 +1,60 @@
+# name: test/sql/mbp10.test
+# description: read_dbn_mbp10() table function
+# group: [sql]
+
+statement error
+SELECT * FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn');
+----
+read_dbn_mbp10
+
+require dbn
+
+query I
+SELECT count(*) FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn');
+----
+2
+
+query IIIIRITTIIII
+SELECT
+    epoch_ns(ts_event),
+    epoch_ns(ts_recv),
+    instrument_id::BIGINT,
+    publisher_id::BIGINT,
+    price,
+    size::BIGINT,
+    action,
+    side,
+    flags::BIGINT,
+    depth::BIGINT,
+    ts_in_delta,
+    sequence::BIGINT
+FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn')
+ORDER BY ts_event, sequence
+LIMIT 1;
+----
+1609160400000429831	1609160400000704060	5482	1	3722.75	1	C	A	128	9	22993	1170352
+
+query RRIIIIRRIIII
+SELECT
+    bid_px_00,
+    ask_px_00,
+    bid_sz_00::BIGINT,
+    ask_sz_00::BIGINT,
+    bid_ct_00::BIGINT,
+    ask_ct_00::BIGINT,
+    bid_px_09,
+    ask_px_09,
+    bid_sz_09::BIGINT,
+    ask_sz_09::BIGINT,
+    bid_ct_09::BIGINT,
+    ask_ct_09::BIGINT
+FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn')
+ORDER BY ts_event, sequence
+LIMIT 1;
+----
+3720.25	3720.5	24	10	15	8	3718.0	3722.75	67	44	39	26
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn'));
+----
+72

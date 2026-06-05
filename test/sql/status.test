@@ -1,0 +1,37 @@
+# name: test/sql/status.test
+# description: read_dbn_status() table function
+# group: [sql]
+
+statement error
+SELECT * FROM read_dbn_status('test/data/test_data.status.dbn');
+----
+read_dbn_status
+
+require dbn
+
+query I
+SELECT count(*) FROM read_dbn_status('test/data/test_data.status.dbn');
+----
+4
+
+# action/reason/trading_event remain raw USMALLINT (forward-compat with new
+# venue codes); is_trading/is_quoting/is_short_sell_restricted are the
+# TriState char bytes ('Y' / 'N' / '~').
+query IIIIIIITTT
+SELECT
+    epoch_ns(ts_event),
+    epoch_ns(ts_recv),
+    instrument_id::BIGINT,
+    publisher_id::BIGINT,
+    action::BIGINT,
+    reason::BIGINT,
+    trading_event::BIGINT,
+    is_trading,
+    is_quoting,
+    is_short_sell_restricted
+FROM read_dbn_status('test/data/test_data.status.dbn')
+ORDER BY ts_event
+LIMIT 2;
+----
+1609110000000000000	1609113600000000000	5482	1	7	1	0	Y	Y	~
+1609190100000000000	1609190100007055917	5482	1	1	1	0	N	Y	~
