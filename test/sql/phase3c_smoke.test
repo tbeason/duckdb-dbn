@@ -1,0 +1,58 @@
+# name: test/sql/phase3c_smoke.test
+# description: smoke test for the 3 trivially-added schemas (cbbo-1m, ohlcv-eod, tcbbo)
+# group: [sql]
+# No upstream fixtures for these specific rtypes — we verify the functions are
+# registered, accept a path, and return 0 rows when given a fixture whose
+# record stream has a different rtype.
+
+statement error
+SELECT * FROM read_dbn_cbbo_1m('test/data/test_data.cbbo-1s.dbn');
+----
+read_dbn_cbbo_1m
+
+statement error
+SELECT * FROM read_dbn_ohlcv_eod('test/data/test_data.ohlcv-1d.dbn');
+----
+read_dbn_ohlcv_eod
+
+statement error
+SELECT * FROM read_dbn_tcbbo('test/data/test_data.cmbp-1.dbn');
+----
+read_dbn_tcbbo
+
+require dbn
+
+# Cbbo-1m reader on a Cbbo-1s fixture: all records are RType::Cbbo1S, so the
+# Cbbo1M filter matches nothing — 0 rows, no error.
+query I
+SELECT count(*) FROM read_dbn_cbbo_1m('test/data/test_data.cbbo-1s.dbn');
+----
+0
+
+# Ohlcv-eod reader on an Ohlcv-1d fixture (which is empty anyway).
+query I
+SELECT count(*) FROM read_dbn_ohlcv_eod('test/data/test_data.ohlcv-1d.dbn');
+----
+0
+
+# Tcbbo reader on a Cmbp-1 fixture: same record struct, different rtype — 0 rows.
+query I
+SELECT count(*) FROM read_dbn_tcbbo('test/data/test_data.cmbp-1.dbn');
+----
+0
+
+# Column shapes are inherited from the cousin schemas — types resolve.
+query III
+SELECT typeof(price), typeof(bid_pb), typeof(side)
+FROM read_dbn_cbbo_1m('test/data/test_data.cbbo-1s.dbn') LIMIT 0;
+----
+
+query III
+SELECT typeof(open), typeof(volume), typeof(ts_event)
+FROM read_dbn_ohlcv_eod('test/data/test_data.ohlcv-1d.dbn') LIMIT 0;
+----
+
+query III
+SELECT typeof(price), typeof(bid_pb), typeof(action)
+FROM read_dbn_tcbbo('test/data/test_data.cmbp-1.dbn') LIMIT 0;
+----

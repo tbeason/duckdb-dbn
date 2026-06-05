@@ -418,7 +418,7 @@ static unique_ptr<FunctionData> CbboBind(ClientContext &, TableFunctionBindInput
 	return std::move(bd);
 }
 
-static void Cbbo1sScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
+static void CbboScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &out, databento::RType rtype) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
 	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
 	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
@@ -437,7 +437,7 @@ static void Cbbo1sScan(ClientContext &, TableFunctionInput &input, DataChunk &ou
 
 	databento::CbboMsg rec {};
 	idx_t n = 0;
-	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Cbbo1S)) {
+	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
 		const auto &L = rec.levels[0];
 		ts_event[n] = TsToInt64(rec.hd.ts_event);
 		ts_recv[n] = TsToInt64(rec.ts_recv);
@@ -456,6 +456,13 @@ static void Cbbo1sScan(ClientContext &, TableFunctionInput &input, DataChunk &ou
 		++n;
 	}
 	out.SetCardinality(n);
+}
+
+static void Cbbo1sScan(ClientContext &c, TableFunctionInput &input, DataChunk &out) {
+	CbboScanImpl(c, input, out, databento::RType::Cbbo1S);
+}
+static void Cbbo1mScan(ClientContext &c, TableFunctionInput &input, DataChunk &out) {
+	CbboScanImpl(c, input, out, databento::RType::Cbbo1M);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -480,7 +487,7 @@ static unique_ptr<FunctionData> Cmbp1Bind(ClientContext &, TableFunctionBindInpu
 	return std::move(bd);
 }
 
-static void Cmbp1Scan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
+static void Cmbp1ScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &out, databento::RType rtype) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
 	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
 	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
@@ -501,7 +508,7 @@ static void Cmbp1Scan(ClientContext &, TableFunctionInput &input, DataChunk &out
 
 	databento::Cmbp1Msg rec {};
 	idx_t n = 0;
-	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Cmbp1)) {
+	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
 		const auto &L = rec.levels[0];
 		ts_event[n] = TsToInt64(rec.hd.ts_event);
 		ts_recv[n] = TsToInt64(rec.ts_recv);
@@ -522,6 +529,13 @@ static void Cmbp1Scan(ClientContext &, TableFunctionInput &input, DataChunk &out
 		++n;
 	}
 	out.SetCardinality(n);
+}
+
+static void Cmbp1Scan(ClientContext &c, TableFunctionInput &input, DataChunk &out) {
+	Cmbp1ScanImpl(c, input, out, databento::RType::Cmbp1);
+}
+static void TcbboScan(ClientContext &c, TableFunctionInput &input, DataChunk &out) {
+	Cmbp1ScanImpl(c, input, out, databento::RType::Tcbbo);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -577,6 +591,9 @@ static void Ohlcv1hScan(ClientContext &c, TableFunctionInput &i, DataChunk &o) {
 }
 static void Ohlcv1dScan(ClientContext &c, TableFunctionInput &i, DataChunk &o) {
 	OhlcvScanImpl(c, i, o, databento::RType::Ohlcv1D);
+}
+static void OhlcvEodScan(ClientContext &c, TableFunctionInput &i, DataChunk &o) {
+	OhlcvScanImpl(c, i, o, databento::RType::OhlcvEod);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -802,6 +819,18 @@ static const SchemaHandler *LookupSchemaHandler(databento::Schema s) {
 		static const SchemaHandler h = {"imbalance", ImbalanceBind, ImbalanceScan};
 		return &h;
 	}
+	case databento::Schema::Cbbo1M: {
+		static const SchemaHandler h = {"cbbo-1m", CbboBind, Cbbo1mScan};
+		return &h;
+	}
+	case databento::Schema::Tcbbo: {
+		static const SchemaHandler h = {"tcbbo", Cmbp1Bind, TcbboScan};
+		return &h;
+	}
+	case databento::Schema::OhlcvEod: {
+		static const SchemaHandler h = {"ohlcv-eod", OhlcvBind, OhlcvEodScan};
+		return &h;
+	}
 	default:
 		return nullptr;
 	}
@@ -979,6 +1008,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	Register(loader, "read_dbn_ohlcv_1d", OhlcvBind, Ohlcv1dScan);
 	Register(loader, "read_dbn_status", StatusBind, StatusScan);
 	Register(loader, "read_dbn_imbalance", ImbalanceBind, ImbalanceScan);
+	Register(loader, "read_dbn_cbbo_1m", CbboBind, Cbbo1mScan);
+	Register(loader, "read_dbn_ohlcv_eod", OhlcvBind, OhlcvEodScan);
+	Register(loader, "read_dbn_tcbbo", Cmbp1Bind, TcbboScan);
 
 	TableFunction mf("dbn_metadata", {LogicalType::VARCHAR}, DbnMetadataScan, DbnMetadataBind, DbnMetadataInitGlobal);
 	loader.RegisterFunction(mf);
