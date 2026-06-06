@@ -7,12 +7,18 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/replacement_scan.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/table_filter.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include <memory>
+#include <array>
+#include <limits>
 #include <utility>
 
 #include "databento/enums.hpp"
@@ -29,22 +35,336 @@ namespace duckdb {
 // these — only the column list and scan loop differ per schema.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Projection + filter pushdown infrastructure
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// All per-schema scans share a common contract:
+//   * The first four logical columns are header-derived:
+//       0 = ts_event (TIMESTAMP_NS, mapped from RecordHeader::ts_event)
+//       1 = ts_recv  (TIMESTAMP_NS) — body field, NOT header. NOT eligible for
+//                                     pre-write filtering by DbnHeaderFilter.
+//       2 = instrument_id (UINTEGER)
+//       3 = publisher_id  (USMALLINT)
+//   * ohlcv schemas omit ts_recv; their layout is
+//       0 = ts_event, 1 = instrument_id, 2 = publisher_id.
+//   * dbn_records exposes (ts_event, rtype, length, publisher_id,
+//                          instrument_id, body); the column indexes of the
+//                          three pushdown-eligible fields differ.
+//
+// Because the canonical schemas all bind ts_event/instrument_id/publisher_id
+// at fixed positions 0/2/3, we parameterize DbnHeaderFilter by *logical column
+// id*. Each scan tells the filter (at init-global time) which logical
+// columns correspond to ts_event / instrument_id / publisher_id; the filter
+// then walks the TableFilterSet looking only at those entries and stashes
+// the predicates as plain integer ranges + IN-lists.
+//
+// We intentionally only honor predicates on the three header fields. Filters
+// on body columns (price, side, action, etc.) are left in the TableFilterSet
+// for DuckDB to evaluate above us — that's how all built-in extension scans
+// behave when they pre-screen on a subset of pushdown columns.
+
+struct DbnHeaderFilter {
+	// ts_event: closed interval. Default = wide open.
+	int64_t ts_event_min = std::numeric_limits<int64_t>::min();
+	int64_t ts_event_max = std::numeric_limits<int64_t>::max();
+	bool ts_event_active = false;
+
+	// instrument_id: optional equality / IN-list / range.
+	std::vector<uint32_t> instr_in;   // empty = no IN-filter
+	uint32_t instr_min = 0;
+	uint32_t instr_max = std::numeric_limits<uint32_t>::max();
+	bool instr_range_active = false;
+
+	// publisher_id: same shape.
+	std::vector<uint16_t> pub_in;
+	uint16_t pub_min = 0;
+	uint16_t pub_max = std::numeric_limits<uint16_t>::max();
+	bool pub_range_active = false;
+
+	bool any_active = false;
+
+	// Returns true iff every active predicate is satisfied.
+	inline bool Matches(const databento::RecordHeader &hd) const {
+		if (!any_active) {
+			return true;
+		}
+		if (ts_event_active) {
+			const auto t = static_cast<int64_t>(hd.ts_event.time_since_epoch().count());
+			if (t < ts_event_min || t > ts_event_max) {
+				return false;
+			}
+		}
+		if (instr_range_active) {
+			if (hd.instrument_id < instr_min || hd.instrument_id > instr_max) {
+				return false;
+			}
+		}
+		if (!instr_in.empty()) {
+			bool ok = false;
+			for (auto v : instr_in) {
+				if (v == hd.instrument_id) { ok = true; break; }
+			}
+			if (!ok) return false;
+		}
+		if (pub_range_active) {
+			if (hd.publisher_id < pub_min || hd.publisher_id > pub_max) {
+				return false;
+			}
+		}
+		if (!pub_in.empty()) {
+			bool ok = false;
+			for (auto v : pub_in) {
+				if (v == hd.publisher_id) { ok = true; break; }
+			}
+			if (!ok) return false;
+		}
+		return true;
+	}
+};
+
+// Tighten min / max for a column whose logical type is integral (signed or
+// unsigned). All inputs come from a ConstantFilter, so values are guaranteed
+// to fit the declared SQL type — the static_casts are safe.
+template <typename T>
+static inline void TightenIntRange(const ConstantFilter &cf, T &lo, T &hi, bool &active) {
+	const auto v = cf.constant.GetValue<int64_t>();
+	const auto tv = static_cast<T>(v);
+	switch (cf.comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+		if (tv > lo) lo = tv;
+		if (tv < hi) hi = tv;
+		active = true;
+		break;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		// hd > tv  ⇒  hd >= tv+1  (only safe when tv < numeric_limits<T>::max())
+		if (tv < std::numeric_limits<T>::max() && static_cast<T>(tv + 1) > lo) {
+			lo = static_cast<T>(tv + 1);
+		}
+		active = true;
+		break;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		if (tv > lo) lo = tv;
+		active = true;
+		break;
+	case ExpressionType::COMPARE_LESSTHAN:
+		if (tv > std::numeric_limits<T>::min() && static_cast<T>(tv - 1) < hi) {
+			hi = static_cast<T>(tv - 1);
+		}
+		active = true;
+		break;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		if (tv < hi) hi = tv;
+		active = true;
+		break;
+	default:
+		// Unsupported comparison — silently let DuckDB re-evaluate above us.
+		break;
+	}
+}
+
+// Specialization for ts_event: timestamps come through as TIMESTAMP_NS, whose
+// physical storage is int64. We pull the raw int64 out via Value::GetValue<int64_t>().
+static inline void TightenTsEventRange(const ConstantFilter &cf, DbnHeaderFilter &hf) {
+	int64_t tv;
+	try {
+		tv = cf.constant.GetValue<int64_t>();
+	} catch (...) {
+		return; // unsupported constant type — skip
+	}
+	switch (cf.comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+		if (tv > hf.ts_event_min) hf.ts_event_min = tv;
+		if (tv < hf.ts_event_max) hf.ts_event_max = tv;
+		hf.ts_event_active = true;
+		break;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		if (tv < std::numeric_limits<int64_t>::max() && tv + 1 > hf.ts_event_min) {
+			hf.ts_event_min = tv + 1;
+		}
+		hf.ts_event_active = true;
+		break;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		if (tv > hf.ts_event_min) hf.ts_event_min = tv;
+		hf.ts_event_active = true;
+		break;
+	case ExpressionType::COMPARE_LESSTHAN:
+		if (tv > std::numeric_limits<int64_t>::min() && tv - 1 < hf.ts_event_max) {
+			hf.ts_event_max = tv - 1;
+		}
+		hf.ts_event_active = true;
+		break;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		if (tv < hf.ts_event_max) hf.ts_event_max = tv;
+		hf.ts_event_active = true;
+		break;
+	default:
+		break;
+	}
+}
+
+// Walk one (column, filter) entry from the TableFilterSet. `which` says which
+// header field the column belongs to. Unknown filter kinds (expression, bloom,
+// dynamic, struct) are silently skipped — DuckDB will re-apply them above us.
+enum class HeaderColumn { TsEvent, InstrumentId, PublisherId };
+
+static void IngestFilter(HeaderColumn which, const TableFilter &flt, DbnHeaderFilter &hf) {
+	switch (flt.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON: {
+		const auto &cf = flt.Cast<ConstantFilter>();
+		switch (which) {
+		case HeaderColumn::TsEvent:
+			TightenTsEventRange(cf, hf);
+			break;
+		case HeaderColumn::InstrumentId:
+			TightenIntRange<uint32_t>(cf, hf.instr_min, hf.instr_max, hf.instr_range_active);
+			break;
+		case HeaderColumn::PublisherId:
+			TightenIntRange<uint16_t>(cf, hf.pub_min, hf.pub_max, hf.pub_range_active);
+			break;
+		}
+		break;
+	}
+	case TableFilterType::IN_FILTER: {
+		const auto &inf = flt.Cast<InFilter>();
+		switch (which) {
+		case HeaderColumn::TsEvent: {
+			// IN on ts_event is rare and would produce a disjoint set, which the
+			// flat min/max can't capture. Skip — DuckDB re-applies it.
+			break;
+		}
+		case HeaderColumn::InstrumentId: {
+			hf.instr_in.reserve(hf.instr_in.size() + inf.values.size());
+			for (auto &v : inf.values) {
+				try {
+					hf.instr_in.push_back(static_cast<uint32_t>(v.GetValue<int64_t>()));
+				} catch (...) {}
+			}
+			break;
+		}
+		case HeaderColumn::PublisherId: {
+			hf.pub_in.reserve(hf.pub_in.size() + inf.values.size());
+			for (auto &v : inf.values) {
+				try {
+					hf.pub_in.push_back(static_cast<uint16_t>(v.GetValue<int64_t>()));
+				} catch (...) {}
+			}
+			break;
+		}
+		}
+		break;
+	}
+	case TableFilterType::CONJUNCTION_AND: {
+		const auto &cj = flt.Cast<ConjunctionAndFilter>();
+		for (auto &child : cj.child_filters) {
+			IngestFilter(which, *child, hf);
+		}
+		break;
+	}
+	case TableFilterType::OPTIONAL_FILTER: {
+		// OptionalFilter wraps a real child filter; the inner one carries the
+		// actual predicate. We unwrap and recurse.
+		// (OptionalFilter is defined as { unique_ptr<TableFilter> child_filter; }
+		// in duckdb/planner/filter/optional_filter.hpp.)
+		struct OptionalFilterShape : public TableFilter {
+			unique_ptr<TableFilter> child_filter;
+		};
+		const auto &of = reinterpret_cast<const OptionalFilterShape &>(flt);
+		if (of.child_filter) {
+			IngestFilter(which, *of.child_filter, hf);
+		}
+		break;
+	}
+	// CONJUNCTION_OR, IS_NULL, IS_NOT_NULL, STRUCT_EXTRACT, DYNAMIC_FILTER,
+	// EXPRESSION_FILTER, BLOOM_FILTER: not pre-screened. DuckDB applies above.
+	default:
+		break;
+	}
+}
+
+// Header-column-id mapping for each per-schema layout. Pass kNoCol when a
+// header field is absent from a schema (ohlcv has no ts_recv, but we don't
+// pre-filter ts_recv anyway, so this mostly matters for asserting positions).
+static constexpr column_t kNoCol = static_cast<column_t>(-1);
+
+struct DbnHeaderColumnLayout {
+	column_t ts_event_col;     // logical column id of ts_event, or kNoCol
+	column_t instrument_id_col;
+	column_t publisher_id_col;
+};
+
+// Standard layout for almost every schema: ts_event=0, instrument_id=2,
+// publisher_id=3. Ohlcv: ts_event=0, instrument_id=1, publisher_id=2.
+// dbn_records: ts_event=0, publisher_id=3, instrument_id=4.
+static constexpr DbnHeaderColumnLayout kHeaderLayoutStandard {0, 2, 3};
+static constexpr DbnHeaderColumnLayout kHeaderLayoutOhlcv    {0, 1, 2};
+static constexpr DbnHeaderColumnLayout kHeaderLayoutRecords  {0, 4, 3};
+
+static DbnHeaderFilter BuildHeaderFilter(optional_ptr<TableFilterSet> filters,
+                                         const DbnHeaderColumnLayout &layout) {
+	DbnHeaderFilter hf;
+	if (!filters) {
+		return hf;
+	}
+	for (auto &entry : filters->filters) {
+		const auto col = static_cast<column_t>(entry.first);
+		const auto &flt = *entry.second;
+		if (col == layout.ts_event_col) {
+			IngestFilter(HeaderColumn::TsEvent, flt, hf);
+		} else if (col == layout.instrument_id_col) {
+			IngestFilter(HeaderColumn::InstrumentId, flt, hf);
+		} else if (col == layout.publisher_id_col) {
+			IngestFilter(HeaderColumn::PublisherId, flt, hf);
+		}
+		// Other columns — body predicates — are silently ignored here. DuckDB
+		// re-evaluates them above the scan.
+	}
+	hf.any_active = hf.ts_event_active || hf.instr_range_active || !hf.instr_in.empty() ||
+	                hf.pub_range_active || !hf.pub_in.empty();
+	return hf;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared bind data and global state. Every per-schema table function uses
+// these — only the column list and scan loop differ per schema.
+// ─────────────────────────────────────────────────────────────────────────────
+
 struct ReadDbnBindData : public TableFunctionData {
 	// Resolved at bind time. Always at least one entry; multiple entries
 	// when the user passed a glob pattern.
 	std::vector<std::string> file_paths;
+	DbnHeaderColumnLayout header_layout = kHeaderLayoutStandard;
 };
 
 struct ReadDbnGlobalState : public GlobalTableFunctionState {
-	explicit ReadDbnGlobalState(std::vector<std::string> paths)
-	    : reader(std::make_unique<duckdb_dbn::DbnFileReader>(std::move(paths))) {}
+	ReadDbnGlobalState(std::vector<std::string> paths,
+	                   std::vector<column_t> column_ids_p,
+	                   DbnHeaderFilter header_filter_p)
+	    : reader(std::make_unique<duckdb_dbn::DbnFileReader>(std::move(paths))),
+	      column_ids(std::move(column_ids_p)),
+	      header_filter(std::move(header_filter_p)) {}
 	std::unique_ptr<duckdb_dbn::DbnFileReader> reader;
+	// Logical column ids the optimizer asked for, in projection order.
+	// out.data[i] corresponds to column_ids[i]. May contain
+	// COLUMN_IDENTIFIER_ROW_ID for row-id requests — scans must treat that
+	// as "skip, no output to fill for this slot" since we never emit row ids.
+	std::vector<column_t> column_ids;
+	DbnHeaderFilter header_filter;
 };
 
-static unique_ptr<GlobalTableFunctionState> ReadDbnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState>
+ReadDbnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
 	auto &bd = input.bind_data->Cast<ReadDbnBindData>();
-	return make_uniq<ReadDbnGlobalState>(bd.file_paths);
+	auto hf = BuildHeaderFilter(input.filters, bd.header_layout);
+	// input.column_ids is empty iff the optimizer wants every bound column
+	// (happens when projection_pushdown is on but the query selects *). In
+	// that case scans below see an empty col_ids and must fall back to the
+	// declared schema order — but with projection_pushdown=true DuckDB
+	// always populates column_ids, so this is fine.
+	std::vector<column_t> col_ids = input.column_ids;
+	return make_uniq<ReadDbnGlobalState>(bd.file_paths, std::move(col_ids), std::move(hf));
 }
+
 
 static std::string GetFilePathArg(TableFunctionBindInput &input) {
 	return input.inputs[0].GetValue<string>();
@@ -94,34 +414,116 @@ static unique_ptr<FunctionData> TradesBind(ClientContext &context, TableFunction
 
 static void TradesScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[2]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[3]);
-	auto price = FlatVector::GetData<double>(out.data[4]);
-	auto size = FlatVector::GetData<uint32_t>(out.data[5]);
-	auto action_v = FlatVector::GetData<string_t>(out.data[6]);
-	auto side_v = FlatVector::GetData<string_t>(out.data[7]);
-	auto flags = FlatVector::GetData<uint8_t>(out.data[8]);
-	auto depth = FlatVector::GetData<uint8_t>(out.data[9]);
-	auto ts_in_d = FlatVector::GetData<int32_t>(out.data[10]);
-	auto seq = FlatVector::GetData<uint32_t>(out.data[11]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	// Safety: with projection_pushdown=true, out.data.size() == projected_count.
+	// We assert in debug to catch any optimizer surprise; in release we trust it.
+	D_ASSERT(out.data.size() == projected_count);
+
+	// Pre-resolve typed pointers exactly once for each projected slot. We
+	// pay the cost of an indirection per projected column (not per record)
+	// and keep the inner loop branch-light. Slots for COLUMN_IDENTIFIER_ROW_ID
+	// (we don't emit row ids) get a null pointer and are skipped in the loop.
+	//
+	// Per-column logical-id constants for trades:
+	enum : column_t {
+		COL_TS_EVENT = 0, COL_TS_RECV = 1, COL_INSTR = 2, COL_PUB = 3,
+		COL_PRICE = 4,    COL_SIZE = 5,    COL_ACTION = 6, COL_SIDE = 7,
+		COL_FLAGS = 8,    COL_DEPTH = 9,   COL_TS_IN_D = 10, COL_SEQ = 11,
+	};
+
+	// One pointer-array entry per *projection slot*, not per logical column.
+	// Index of arrays below is the projection position, value is the typed
+	// data pointer for that slot's underlying vector.
+	std::array<int64_t *,   16> p_i64  {}; // ts_event, ts_recv
+	std::array<uint32_t *,  16> p_u32  {}; // instrument_id, size, sequence
+	std::array<uint16_t *,  16> p_u16  {}; // publisher_id
+	std::array<double *,    16> p_dbl  {}; // price
+	std::array<string_t *,  16> p_str  {}; // action, side
+	std::array<uint8_t *,   16> p_u8   {}; // flags, depth
+	std::array<int32_t *,   16> p_i32  {}; // ts_in_delta
+	D_ASSERT(projected_count <= 16);       // Trades has 12 columns; safe.
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) {
+			continue; // No row ids emitted; DuckDB will not actually read this slot.
+		}
+		switch (cid) {
+		case COL_TS_EVENT: p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_RECV:  p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:    p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:      p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_PRICE:    p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_SIZE:     p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_ACTION:   p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_SIDE:     p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_FLAGS:    p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_DEPTH:    p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_TS_IN_D:  p_i32[i] = FlatVector::GetData<int32_t>(out.data[i]); break;
+		case COL_SEQ:      p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		default:
+			// Unknown column id from the optimizer (would be a DuckDB bug given
+			// our bind declares exactly 12 columns). Leave the slot pointer
+			// null; the loop's default branch ignores it.
+			break;
+		}
+	}
 
 	databento::TradeMsg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Mbp0)) {
-		ts_event[n] = TsToInt64(rec.hd.ts_event);
-		ts_recv[n] = TsToInt64(rec.ts_recv);
-		instr[n] = rec.hd.instrument_id;
-		pub[n] = rec.hd.publisher_id;
-		price[n] = static_cast<double>(rec.price) * 1e-9;
-		size[n] = rec.size;
-		action_v[n] = duckdb_dbn::EmitChar1(out.data[6], static_cast<char>(rec.action));
-		side_v[n] = duckdb_dbn::EmitChar1(out.data[7], static_cast<char>(rec.side));
-		flags[n] = rec.flags.Raw();
-		depth[n] = rec.depth;
-		ts_in_d[n] = static_cast<int32_t>(rec.ts_in_delta.count());
-		seq[n] = rec.sequence;
+		// Header pre-screen. Body-field predicates are NOT honored here —
+		// DuckDB re-evaluates them above us.
+		if (!st.header_filter.Matches(rec.hd)) {
+			continue;
+		}
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT:
+				p_i64[i][n] = TsToInt64(rec.hd.ts_event);
+				break;
+			case COL_TS_RECV:
+				p_i64[i][n] = TsToInt64(rec.ts_recv);
+				break;
+			case COL_INSTR:
+				p_u32[i][n] = rec.hd.instrument_id;
+				break;
+			case COL_PUB:
+				p_u16[i][n] = rec.hd.publisher_id;
+				break;
+			case COL_PRICE:
+				p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9;
+				break;
+			case COL_SIZE:
+				p_u32[i][n] = rec.size;
+				break;
+			case COL_ACTION:
+				// StringVector::AddString is only invoked when the column is
+				// actually projected (we never reach this case otherwise).
+				p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.action));
+				break;
+			case COL_SIDE:
+				p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side));
+				break;
+			case COL_FLAGS:
+				p_u8[i][n] = rec.flags.Raw();
+				break;
+			case COL_DEPTH:
+				p_u8[i][n] = rec.depth;
+				break;
+			case COL_TS_IN_D:
+				p_i32[i][n] = static_cast<int32_t>(rec.ts_in_delta.count());
+				break;
+			case COL_SEQ:
+				p_u32[i][n] = rec.sequence;
+				break;
+			default:
+				// COLUMN_IDENTIFIER_ROW_ID and unknown ids: skip.
+				break;
+			}
+		}
 		++n;
 	}
 	out.SetCardinality(n);
@@ -148,36 +550,71 @@ static unique_ptr<FunctionData> MboBind(ClientContext &context, TableFunctionBin
 
 static void MboScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[2]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[3]);
-	auto order_id = FlatVector::GetData<uint64_t>(out.data[4]);
-	auto price = FlatVector::GetData<double>(out.data[5]);
-	auto size = FlatVector::GetData<uint32_t>(out.data[6]);
-	auto flags = FlatVector::GetData<uint8_t>(out.data[7]);
-	auto chan = FlatVector::GetData<uint8_t>(out.data[8]);
-	auto action_v = FlatVector::GetData<string_t>(out.data[9]);
-	auto side_v = FlatVector::GetData<string_t>(out.data[10]);
-	auto ts_in_d = FlatVector::GetData<int32_t>(out.data[11]);
-	auto seq = FlatVector::GetData<uint32_t>(out.data[12]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0, COL_TS_RECV = 1, COL_INSTR = 2,    COL_PUB = 3,
+		COL_ORDER_ID = 4, COL_PRICE = 5,   COL_SIZE = 6,     COL_FLAGS = 7,
+		COL_CHANNEL  = 8, COL_ACTION = 9,  COL_SIDE = 10,    COL_TS_IN_D = 11,
+		COL_SEQ      = 12,
+	};
+
+	std::array<int64_t *,  16> p_i64 {};
+	std::array<uint32_t *, 16> p_u32 {};
+	std::array<uint16_t *, 16> p_u16 {};
+	std::array<uint64_t *, 16> p_u64 {};
+	std::array<double *,   16> p_dbl {};
+	std::array<uint8_t *,  16> p_u8  {};
+	std::array<string_t *, 16> p_str {};
+	std::array<int32_t *,  16> p_i32 {};
+	D_ASSERT(projected_count <= 16);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT: p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_RECV:  p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:    p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:      p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_ORDER_ID: p_u64[i] = FlatVector::GetData<uint64_t>(out.data[i]); break;
+		case COL_PRICE:    p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_SIZE:     p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_FLAGS:    p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_CHANNEL:  p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_ACTION:   p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_SIDE:     p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_TS_IN_D:  p_i32[i] = FlatVector::GetData<int32_t>(out.data[i]); break;
+		case COL_SEQ:      p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		default: break;
+		}
+	}
 
 	databento::MboMsg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Mbo)) {
-		ts_event[n] = TsToInt64(rec.hd.ts_event);
-		ts_recv[n] = TsToInt64(rec.ts_recv);
-		instr[n] = rec.hd.instrument_id;
-		pub[n] = rec.hd.publisher_id;
-		order_id[n] = rec.order_id;
-		price[n] = static_cast<double>(rec.price) * 1e-9;
-		size[n] = rec.size;
-		flags[n] = rec.flags.Raw();
-		chan[n] = rec.channel_id;
-		action_v[n] = duckdb_dbn::EmitChar1(out.data[9], static_cast<char>(rec.action));
-		side_v[n] = duckdb_dbn::EmitChar1(out.data[10], static_cast<char>(rec.side));
-		ts_in_d[n] = static_cast<int32_t>(rec.ts_in_delta.count());
-		seq[n] = rec.sequence;
+		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT: p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+			case COL_TS_RECV:  p_i64[i][n] = TsToInt64(rec.ts_recv); break;
+			case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
+			case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
+			case COL_ORDER_ID: p_u64[i][n] = rec.order_id; break;
+			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+			case COL_SIZE:     p_u32[i][n] = rec.size; break;
+			case COL_FLAGS:    p_u8[i][n]  = rec.flags.Raw(); break;
+			case COL_CHANNEL:  p_u8[i][n]  = rec.channel_id; break;
+			case COL_ACTION:   p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.action)); break;
+			case COL_SIDE:     p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
+			case COL_TS_IN_D:  p_i32[i][n] = static_cast<int32_t>(rec.ts_in_delta.count()); break;
+			case COL_SEQ:      p_u32[i][n] = rec.sequence; break;
+			default: break;
+			}
+		}
 		++n;
 	}
 	out.SetCardinality(n);
@@ -206,41 +643,75 @@ static unique_ptr<FunctionData> Mbp1Bind(ClientContext &context, TableFunctionBi
 
 static void Mbp1ScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &out, databento::RType rtype) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[2]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[3]);
-	auto bid_px = FlatVector::GetData<double>(out.data[4]);
-	auto ask_px = FlatVector::GetData<double>(out.data[5]);
-	auto bid_sz = FlatVector::GetData<uint32_t>(out.data[6]);
-	auto ask_sz = FlatVector::GetData<uint32_t>(out.data[7]);
-	auto bid_ct = FlatVector::GetData<uint32_t>(out.data[8]);
-	auto ask_ct = FlatVector::GetData<uint32_t>(out.data[9]);
-	auto flags = FlatVector::GetData<uint8_t>(out.data[10]);
-	auto ts_in_d = FlatVector::GetData<int32_t>(out.data[11]);
-	auto seq = FlatVector::GetData<uint32_t>(out.data[12]);
-	auto action_v = FlatVector::GetData<string_t>(out.data[13]);
-	auto side_v = FlatVector::GetData<string_t>(out.data[14]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0,  COL_TS_RECV = 1,  COL_INSTR = 2,    COL_PUB = 3,
+		COL_BID_PRICE = 4, COL_ASK_PRICE = 5, COL_BID_SIZE = 6, COL_ASK_SIZE = 7,
+		COL_BID_CT = 8,    COL_ASK_CT = 9,   COL_FLAGS = 10,   COL_TS_IN_D = 11,
+		COL_SEQ = 12,      COL_ACTION = 13,  COL_SIDE = 14,
+	};
+
+	std::array<int64_t *,  16> p_i64 {};
+	std::array<uint32_t *, 16> p_u32 {};
+	std::array<uint16_t *, 16> p_u16 {};
+	std::array<double *,   16> p_dbl {};
+	std::array<uint8_t *,  16> p_u8  {};
+	std::array<int32_t *,  16> p_i32 {};
+	std::array<string_t *, 16> p_str {};
+	D_ASSERT(projected_count <= 16);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT:  p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_RECV:   p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:     p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:       p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_BID_PRICE: p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_ASK_PRICE: p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_BID_SIZE:  p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_ASK_SIZE:  p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_BID_CT:    p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_ASK_CT:    p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_FLAGS:     p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_TS_IN_D:   p_i32[i] = FlatVector::GetData<int32_t>(out.data[i]); break;
+		case COL_SEQ:       p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_ACTION:    p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_SIDE:      p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		default: break;
+		}
+	}
 
 	databento::Mbp1Msg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
+		if (!st.header_filter.Matches(rec.hd)) { continue; }
 		const auto &L = rec.levels[0];
-		ts_event[n] = TsToInt64(rec.hd.ts_event);
-		ts_recv[n] = TsToInt64(rec.ts_recv);
-		instr[n] = rec.hd.instrument_id;
-		pub[n] = rec.hd.publisher_id;
-		bid_px[n] = static_cast<double>(L.bid_px) * 1e-9;
-		ask_px[n] = static_cast<double>(L.ask_px) * 1e-9;
-		bid_sz[n] = L.bid_sz;
-		ask_sz[n] = L.ask_sz;
-		bid_ct[n] = L.bid_ct;
-		ask_ct[n] = L.ask_ct;
-		flags[n] = rec.flags.Raw();
-		ts_in_d[n] = static_cast<int32_t>(rec.ts_in_delta.count());
-		seq[n] = rec.sequence;
-		action_v[n] = duckdb_dbn::EmitChar1(out.data[13], static_cast<char>(rec.action));
-		side_v[n] = duckdb_dbn::EmitChar1(out.data[14], static_cast<char>(rec.side));
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT:  p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+			case COL_TS_RECV:   p_i64[i][n] = TsToInt64(rec.ts_recv); break;
+			case COL_INSTR:     p_u32[i][n] = rec.hd.instrument_id; break;
+			case COL_PUB:       p_u16[i][n] = rec.hd.publisher_id; break;
+			case COL_BID_PRICE: p_dbl[i][n] = static_cast<double>(L.bid_px) * 1e-9; break;
+			case COL_ASK_PRICE: p_dbl[i][n] = static_cast<double>(L.ask_px) * 1e-9; break;
+			case COL_BID_SIZE:  p_u32[i][n] = L.bid_sz; break;
+			case COL_ASK_SIZE:  p_u32[i][n] = L.ask_sz; break;
+			case COL_BID_CT:    p_u32[i][n] = L.bid_ct; break;
+			case COL_ASK_CT:    p_u32[i][n] = L.ask_ct; break;
+			case COL_FLAGS:     p_u8[i][n]  = rec.flags.Raw(); break;
+			case COL_TS_IN_D:   p_i32[i][n] = static_cast<int32_t>(rec.ts_in_delta.count()); break;
+			case COL_SEQ:       p_u32[i][n] = rec.sequence; break;
+			case COL_ACTION:    p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.action)); break;
+			case COL_SIDE:      p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
+			default: break;
+			}
+		}
 		++n;
 	}
 	out.SetCardinality(n);
@@ -303,54 +774,100 @@ static unique_ptr<FunctionData> Mbp10Bind(ClientContext &context, TableFunctionB
 
 static void Mbp10Scan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[2]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[3]);
-	auto price = FlatVector::GetData<double>(out.data[4]);
-	auto size = FlatVector::GetData<uint32_t>(out.data[5]);
-	auto action_v = FlatVector::GetData<string_t>(out.data[6]);
-	auto side_v = FlatVector::GetData<string_t>(out.data[7]);
-	auto flags = FlatVector::GetData<uint8_t>(out.data[8]);
-	auto depth = FlatVector::GetData<uint8_t>(out.data[9]);
-	auto ts_in_d = FlatVector::GetData<int32_t>(out.data[10]);
-	auto seq = FlatVector::GetData<uint32_t>(out.data[11]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
 
-	double *bid_px[10], *ask_px[10];
-	uint32_t *bid_sz[10], *ask_sz[10], *bid_ct[10], *ask_ct[10];
-	for (int i = 0; i < 10; ++i) {
-		const idx_t base = 12 + i * 6;
-		bid_px[i] = FlatVector::GetData<double>(out.data[base + 0]);
-		ask_px[i] = FlatVector::GetData<double>(out.data[base + 1]);
-		bid_sz[i] = FlatVector::GetData<uint32_t>(out.data[base + 2]);
-		ask_sz[i] = FlatVector::GetData<uint32_t>(out.data[base + 3]);
-		bid_ct[i] = FlatVector::GetData<uint32_t>(out.data[base + 4]);
-		ask_ct[i] = FlatVector::GetData<uint32_t>(out.data[base + 5]);
+	enum : column_t {
+		COL_TS_EVENT = 0, COL_TS_RECV = 1, COL_INSTR = 2, COL_PUB = 3,
+		COL_PRICE = 4,    COL_SIZE = 5,    COL_ACTION = 6, COL_SIDE = 7,
+		COL_FLAGS = 8,    COL_DEPTH = 9,   COL_TS_IN_D = 10, COL_SEQ = 11,
+	};
+	static constexpr column_t COL_LEVELS_BASE = 12;
+	static constexpr column_t COL_LEVELS_END  = COL_LEVELS_BASE + 60;
+
+	std::array<int64_t *,   72> p_i64  {};
+	std::array<uint32_t *,  72> p_u32  {};
+	std::array<uint16_t *,  72> p_u16  {};
+	std::array<double *,    72> p_dbl  {};
+	std::array<string_t *,  72> p_str  {};
+	std::array<uint8_t *,   72> p_u8   {};
+	std::array<int32_t *,   72> p_i32  {};
+	D_ASSERT(projected_count <= 72);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT: p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_RECV:  p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:    p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:      p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_PRICE:    p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_SIZE:     p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_ACTION:   p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_SIDE:     p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_FLAGS:    p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_DEPTH:    p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_TS_IN_D:  p_i32[i] = FlatVector::GetData<int32_t>(out.data[i]); break;
+		case COL_SEQ:      p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		default:
+			if (cid >= COL_LEVELS_BASE && cid < COL_LEVELS_END) {
+				const column_t offset = cid - COL_LEVELS_BASE;
+				const column_t sub    = offset % 6;
+				switch (sub) {
+				case 0:
+				case 1:
+					p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+				case 2:
+				case 3:
+				case 4:
+				case 5:
+					p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+				default: break;
+				}
+			}
+			break;
+		}
 	}
 
 	databento::Mbp10Msg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Mbp10)) {
-		ts_event[n] = TsToInt64(rec.hd.ts_event);
-		ts_recv[n] = TsToInt64(rec.ts_recv);
-		instr[n] = rec.hd.instrument_id;
-		pub[n] = rec.hd.publisher_id;
-		price[n] = static_cast<double>(rec.price) * 1e-9;
-		size[n] = rec.size;
-		action_v[n] = duckdb_dbn::EmitChar1(out.data[6], static_cast<char>(rec.action));
-		side_v[n] = duckdb_dbn::EmitChar1(out.data[7], static_cast<char>(rec.side));
-		flags[n] = rec.flags.Raw();
-		depth[n] = rec.depth;
-		ts_in_d[n] = static_cast<int32_t>(rec.ts_in_delta.count());
-		seq[n] = rec.sequence;
-		for (int i = 0; i < 10; ++i) {
-			const auto &L = rec.levels[i];
-			bid_px[i][n] = static_cast<double>(L.bid_px) * 1e-9;
-			ask_px[i][n] = static_cast<double>(L.ask_px) * 1e-9;
-			bid_sz[i][n] = L.bid_sz;
-			ask_sz[i][n] = L.ask_sz;
-			bid_ct[i][n] = L.bid_ct;
-			ask_ct[i][n] = L.ask_ct;
+		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT: p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+			case COL_TS_RECV:  p_i64[i][n] = TsToInt64(rec.ts_recv); break;
+			case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
+			case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
+			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+			case COL_SIZE:     p_u32[i][n] = rec.size; break;
+			case COL_ACTION:   p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.action)); break;
+			case COL_SIDE:     p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
+			case COL_FLAGS:    p_u8[i][n]  = rec.flags.Raw(); break;
+			case COL_DEPTH:    p_u8[i][n]  = rec.depth; break;
+			case COL_TS_IN_D:  p_i32[i][n] = static_cast<int32_t>(rec.ts_in_delta.count()); break;
+			case COL_SEQ:      p_u32[i][n] = rec.sequence; break;
+			default:
+				if (cid >= COL_LEVELS_BASE && cid < COL_LEVELS_END) {
+					const column_t offset = cid - COL_LEVELS_BASE;
+					const column_t lvl    = offset / 6;
+					const column_t sub    = offset % 6;
+					const auto &L = rec.levels[lvl];
+					switch (sub) {
+					case 0: p_dbl[i][n] = static_cast<double>(L.bid_px) * 1e-9; break;
+					case 1: p_dbl[i][n] = static_cast<double>(L.ask_px) * 1e-9; break;
+					case 2: p_u32[i][n] = L.bid_sz; break;
+					case 3: p_u32[i][n] = L.ask_sz; break;
+					case 4: p_u32[i][n] = L.bid_ct; break;
+					case 5: p_u32[i][n] = L.ask_ct; break;
+					default: break;
+					}
+				}
+				break;
+			}
 		}
 		++n;
 	}
@@ -379,41 +896,74 @@ static unique_ptr<FunctionData> BboBind(ClientContext &context, TableFunctionBin
 
 static void BboScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &out, databento::RType rtype) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[2]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[3]);
-	auto price = FlatVector::GetData<double>(out.data[4]);
-	auto size = FlatVector::GetData<uint32_t>(out.data[5]);
-	auto side_v = FlatVector::GetData<string_t>(out.data[6]);
-	auto flags = FlatVector::GetData<uint8_t>(out.data[7]);
-	auto bid_px = FlatVector::GetData<double>(out.data[8]);
-	auto ask_px = FlatVector::GetData<double>(out.data[9]);
-	auto bid_sz = FlatVector::GetData<uint32_t>(out.data[10]);
-	auto ask_sz = FlatVector::GetData<uint32_t>(out.data[11]);
-	auto bid_ct = FlatVector::GetData<uint32_t>(out.data[12]);
-	auto ask_ct = FlatVector::GetData<uint32_t>(out.data[13]);
-	auto seq = FlatVector::GetData<uint32_t>(out.data[14]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0,  COL_TS_RECV = 1,   COL_INSTR = 2,    COL_PUB = 3,
+		COL_PRICE = 4,     COL_SIZE = 5,      COL_SIDE = 6,     COL_FLAGS = 7,
+		COL_BID_PRICE = 8, COL_ASK_PRICE = 9, COL_BID_SIZE = 10, COL_ASK_SIZE = 11,
+		COL_BID_CT = 12,   COL_ASK_CT = 13,   COL_SEQ = 14,
+	};
+
+	std::array<int64_t *,  16> p_i64 {};
+	std::array<uint32_t *, 16> p_u32 {};
+	std::array<uint16_t *, 16> p_u16 {};
+	std::array<double *,   16> p_dbl {};
+	std::array<string_t *, 16> p_str {};
+	std::array<uint8_t *,  16> p_u8  {};
+	D_ASSERT(projected_count <= 16);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT:   p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_RECV:    p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:      p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:        p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_PRICE:      p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_SIZE:       p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_SIDE:       p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_FLAGS:      p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_BID_PRICE:  p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_ASK_PRICE:  p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_BID_SIZE:   p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_ASK_SIZE:   p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_BID_CT:     p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_ASK_CT:     p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_SEQ:        p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		default: break;
+		}
+	}
 
 	databento::BboMsg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
+		if (!st.header_filter.Matches(rec.hd)) { continue; }
 		const auto &L = rec.levels[0];
-		ts_event[n] = TsToInt64(rec.hd.ts_event);
-		ts_recv[n] = TsToInt64(rec.ts_recv);
-		instr[n] = rec.hd.instrument_id;
-		pub[n] = rec.hd.publisher_id;
-		price[n] = static_cast<double>(rec.price) * 1e-9;
-		size[n] = rec.size;
-		side_v[n] = duckdb_dbn::EmitChar1(out.data[6], static_cast<char>(rec.side));
-		flags[n] = rec.flags.Raw();
-		bid_px[n] = static_cast<double>(L.bid_px) * 1e-9;
-		ask_px[n] = static_cast<double>(L.ask_px) * 1e-9;
-		bid_sz[n] = L.bid_sz;
-		ask_sz[n] = L.ask_sz;
-		bid_ct[n] = L.bid_ct;
-		ask_ct[n] = L.ask_ct;
-		seq[n] = rec.sequence;
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT:   p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+			case COL_TS_RECV:    p_i64[i][n] = TsToInt64(rec.ts_recv); break;
+			case COL_INSTR:      p_u32[i][n] = rec.hd.instrument_id; break;
+			case COL_PUB:        p_u16[i][n] = rec.hd.publisher_id; break;
+			case COL_PRICE:      p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+			case COL_SIZE:       p_u32[i][n] = rec.size; break;
+			case COL_SIDE:       p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
+			case COL_FLAGS:      p_u8[i][n]  = rec.flags.Raw(); break;
+			case COL_BID_PRICE:  p_dbl[i][n] = static_cast<double>(L.bid_px) * 1e-9; break;
+			case COL_ASK_PRICE:  p_dbl[i][n] = static_cast<double>(L.ask_px) * 1e-9; break;
+			case COL_BID_SIZE:   p_u32[i][n] = L.bid_sz; break;
+			case COL_ASK_SIZE:   p_u32[i][n] = L.ask_sz; break;
+			case COL_BID_CT:     p_u32[i][n] = L.bid_ct; break;
+			case COL_ASK_CT:     p_u32[i][n] = L.ask_ct; break;
+			case COL_SEQ:        p_u32[i][n] = rec.sequence; break;
+			default: break;
+			}
+		}
 		++n;
 	}
 	out.SetCardinality(n);
@@ -447,39 +997,72 @@ static unique_ptr<FunctionData> CbboBind(ClientContext &context, TableFunctionBi
 
 static void CbboScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &out, databento::RType rtype) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[2]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[3]);
-	auto price = FlatVector::GetData<double>(out.data[4]);
-	auto size = FlatVector::GetData<uint32_t>(out.data[5]);
-	auto side_v = FlatVector::GetData<string_t>(out.data[6]);
-	auto flags = FlatVector::GetData<uint8_t>(out.data[7]);
-	auto bid_px = FlatVector::GetData<double>(out.data[8]);
-	auto ask_px = FlatVector::GetData<double>(out.data[9]);
-	auto bid_sz = FlatVector::GetData<uint32_t>(out.data[10]);
-	auto ask_sz = FlatVector::GetData<uint32_t>(out.data[11]);
-	auto bid_pb = FlatVector::GetData<uint16_t>(out.data[12]);
-	auto ask_pb = FlatVector::GetData<uint16_t>(out.data[13]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0, COL_TS_RECV = 1, COL_INSTR = 2,    COL_PUB = 3,
+		COL_PRICE = 4,    COL_SIZE = 5,    COL_SIDE = 6,     COL_FLAGS = 7,
+		COL_BID_PX = 8,   COL_ASK_PX = 9,  COL_BID_SZ = 10,  COL_ASK_SZ = 11,
+		COL_BID_PB = 12,  COL_ASK_PB = 13,
+	};
+
+	std::array<int64_t *,  16> p_i64 {};
+	std::array<uint32_t *, 16> p_u32 {};
+	std::array<uint16_t *, 16> p_u16 {};
+	std::array<double *,   16> p_dbl {};
+	std::array<string_t *, 16> p_str {};
+	std::array<uint8_t *,  16> p_u8  {};
+	D_ASSERT(projected_count <= 16);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT: p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_RECV:  p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:    p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:      p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_PRICE:    p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_SIZE:     p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_SIDE:     p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_FLAGS:    p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_BID_PX:   p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_ASK_PX:   p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_BID_SZ:   p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_ASK_SZ:   p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_BID_PB:   p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_ASK_PB:   p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		default: break;
+		}
+	}
 
 	databento::CbboMsg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
+		if (!st.header_filter.Matches(rec.hd)) { continue; }
 		const auto &L = rec.levels[0];
-		ts_event[n] = TsToInt64(rec.hd.ts_event);
-		ts_recv[n] = TsToInt64(rec.ts_recv);
-		instr[n] = rec.hd.instrument_id;
-		pub[n] = rec.hd.publisher_id;
-		price[n] = static_cast<double>(rec.price) * 1e-9;
-		size[n] = rec.size;
-		side_v[n] = duckdb_dbn::EmitChar1(out.data[6], static_cast<char>(rec.side));
-		flags[n] = rec.flags.Raw();
-		bid_px[n] = static_cast<double>(L.bid_px) * 1e-9;
-		ask_px[n] = static_cast<double>(L.ask_px) * 1e-9;
-		bid_sz[n] = L.bid_sz;
-		ask_sz[n] = L.ask_sz;
-		bid_pb[n] = L.bid_pb;
-		ask_pb[n] = L.ask_pb;
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT: p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+			case COL_TS_RECV:  p_i64[i][n] = TsToInt64(rec.ts_recv); break;
+			case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
+			case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
+			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+			case COL_SIZE:     p_u32[i][n] = rec.size; break;
+			case COL_SIDE:     p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
+			case COL_FLAGS:    p_u8[i][n]  = rec.flags.Raw(); break;
+			case COL_BID_PX:   p_dbl[i][n] = static_cast<double>(L.bid_px) * 1e-9; break;
+			case COL_ASK_PX:   p_dbl[i][n] = static_cast<double>(L.ask_px) * 1e-9; break;
+			case COL_BID_SZ:   p_u32[i][n] = L.bid_sz; break;
+			case COL_ASK_SZ:   p_u32[i][n] = L.ask_sz; break;
+			case COL_BID_PB:   p_u16[i][n] = L.bid_pb; break;
+			case COL_ASK_PB:   p_u16[i][n] = L.ask_pb; break;
+			default: break;
+			}
+		}
 		++n;
 	}
 	out.SetCardinality(n);
@@ -516,43 +1099,77 @@ static unique_ptr<FunctionData> Cmbp1Bind(ClientContext &context, TableFunctionB
 
 static void Cmbp1ScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &out, databento::RType rtype) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[2]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[3]);
-	auto price = FlatVector::GetData<double>(out.data[4]);
-	auto size = FlatVector::GetData<uint32_t>(out.data[5]);
-	auto action_v = FlatVector::GetData<string_t>(out.data[6]);
-	auto side_v = FlatVector::GetData<string_t>(out.data[7]);
-	auto flags = FlatVector::GetData<uint8_t>(out.data[8]);
-	auto ts_in_d = FlatVector::GetData<int32_t>(out.data[9]);
-	auto bid_px = FlatVector::GetData<double>(out.data[10]);
-	auto ask_px = FlatVector::GetData<double>(out.data[11]);
-	auto bid_sz = FlatVector::GetData<uint32_t>(out.data[12]);
-	auto ask_sz = FlatVector::GetData<uint32_t>(out.data[13]);
-	auto bid_pb = FlatVector::GetData<uint16_t>(out.data[14]);
-	auto ask_pb = FlatVector::GetData<uint16_t>(out.data[15]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0,  COL_TS_RECV = 1,  COL_INSTR = 2,    COL_PUB = 3,
+		COL_PRICE = 4,     COL_SIZE = 5,     COL_ACTION = 6,   COL_SIDE = 7,
+		COL_FLAGS = 8,     COL_TS_IN_D = 9,  COL_BID_PX = 10,  COL_ASK_PX = 11,
+		COL_BID_SZ = 12,   COL_ASK_SZ = 13,  COL_BID_PB = 14,  COL_ASK_PB = 15,
+	};
+
+	std::array<int64_t *,   16> p_i64  {};
+	std::array<uint32_t *,  16> p_u32  {};
+	std::array<uint16_t *,  16> p_u16  {};
+	std::array<double *,    16> p_dbl  {};
+	std::array<string_t *,  16> p_str  {};
+	std::array<uint8_t *,   16> p_u8   {};
+	std::array<int32_t *,   16> p_i32  {};
+	D_ASSERT(projected_count <= 16);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT: p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_RECV:  p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:    p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:      p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_PRICE:    p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_SIZE:     p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_ACTION:   p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_SIDE:     p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_FLAGS:    p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_TS_IN_D:  p_i32[i] = FlatVector::GetData<int32_t>(out.data[i]); break;
+		case COL_BID_PX:   p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_ASK_PX:   p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_BID_SZ:   p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_ASK_SZ:   p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_BID_PB:   p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_ASK_PB:   p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		default: break;
+		}
+	}
 
 	databento::Cmbp1Msg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
+		if (!st.header_filter.Matches(rec.hd)) { continue; }
 		const auto &L = rec.levels[0];
-		ts_event[n] = TsToInt64(rec.hd.ts_event);
-		ts_recv[n] = TsToInt64(rec.ts_recv);
-		instr[n] = rec.hd.instrument_id;
-		pub[n] = rec.hd.publisher_id;
-		price[n] = static_cast<double>(rec.price) * 1e-9;
-		size[n] = rec.size;
-		action_v[n] = duckdb_dbn::EmitChar1(out.data[6], static_cast<char>(rec.action));
-		side_v[n] = duckdb_dbn::EmitChar1(out.data[7], static_cast<char>(rec.side));
-		flags[n] = rec.flags.Raw();
-		ts_in_d[n] = static_cast<int32_t>(rec.ts_in_delta.count());
-		bid_px[n] = static_cast<double>(L.bid_px) * 1e-9;
-		ask_px[n] = static_cast<double>(L.ask_px) * 1e-9;
-		bid_sz[n] = L.bid_sz;
-		ask_sz[n] = L.ask_sz;
-		bid_pb[n] = L.bid_pb;
-		ask_pb[n] = L.ask_pb;
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT: p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+			case COL_TS_RECV:  p_i64[i][n] = TsToInt64(rec.ts_recv); break;
+			case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
+			case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
+			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+			case COL_SIZE:     p_u32[i][n] = rec.size; break;
+			case COL_ACTION:   p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.action)); break;
+			case COL_SIDE:     p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
+			case COL_FLAGS:    p_u8[i][n]  = rec.flags.Raw(); break;
+			case COL_TS_IN_D:  p_i32[i][n] = static_cast<int32_t>(rec.ts_in_delta.count()); break;
+			case COL_BID_PX:   p_dbl[i][n] = static_cast<double>(L.bid_px) * 1e-9; break;
+			case COL_ASK_PX:   p_dbl[i][n] = static_cast<double>(L.ask_px) * 1e-9; break;
+			case COL_BID_SZ:   p_u32[i][n] = L.bid_sz; break;
+			case COL_ASK_SZ:   p_u32[i][n] = L.ask_sz; break;
+			case COL_BID_PB:   p_u16[i][n] = L.bid_pb; break;
+			case COL_ASK_PB:   p_u16[i][n] = L.ask_pb; break;
+			default: break;
+			}
+		}
 		++n;
 	}
 	out.SetCardinality(n);
@@ -574,6 +1191,7 @@ static unique_ptr<FunctionData> OhlcvBind(ClientContext &context, TableFunctionB
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
 	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
+	bd->header_layout = kHeaderLayoutOhlcv;
 	names = {"ts_event", "instrument_id", "publisher_id", "open", "high", "low", "close", "volume"};
 	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::UINTEGER, LogicalType::USMALLINT, LogicalType::DOUBLE,
 	                LogicalType::DOUBLE,       LogicalType::DOUBLE,   LogicalType::DOUBLE,    LogicalType::UBIGINT};
@@ -582,26 +1200,57 @@ static unique_ptr<FunctionData> OhlcvBind(ClientContext &context, TableFunctionB
 
 static void OhlcvScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &out, databento::RType rtype) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[1]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[2]);
-	auto open_ = FlatVector::GetData<double>(out.data[3]);
-	auto high = FlatVector::GetData<double>(out.data[4]);
-	auto low = FlatVector::GetData<double>(out.data[5]);
-	auto close = FlatVector::GetData<double>(out.data[6]);
-	auto volume = FlatVector::GetData<uint64_t>(out.data[7]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0, COL_INSTR = 1, COL_PUB = 2,
+		COL_OPEN = 3,     COL_HIGH = 4,  COL_LOW = 5,
+		COL_CLOSE = 6,    COL_VOLUME = 7,
+	};
+
+	std::array<int64_t *,  16> p_i64 {};
+	std::array<uint32_t *, 16> p_u32 {};
+	std::array<uint16_t *, 16> p_u16 {};
+	std::array<double *,   16> p_dbl {};
+	std::array<uint64_t *, 16> p_u64 {};
+	D_ASSERT(projected_count <= 16);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT: p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:    p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:      p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_OPEN:     p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_HIGH:     p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_LOW:      p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_CLOSE:    p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_VOLUME:   p_u64[i] = FlatVector::GetData<uint64_t>(out.data[i]); break;
+		default: break;
+		}
+	}
 
 	databento::OhlcvMsg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
-		ts_event[n] = TsToInt64(rec.hd.ts_event);
-		instr[n] = rec.hd.instrument_id;
-		pub[n] = rec.hd.publisher_id;
-		open_[n] = static_cast<double>(rec.open) * 1e-9;
-		high[n] = static_cast<double>(rec.high) * 1e-9;
-		low[n] = static_cast<double>(rec.low) * 1e-9;
-		close[n] = static_cast<double>(rec.close) * 1e-9;
-		volume[n] = rec.volume;
+		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT: p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+			case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
+			case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
+			case COL_OPEN:     p_dbl[i][n] = static_cast<double>(rec.open) * 1e-9; break;
+			case COL_HIGH:     p_dbl[i][n] = static_cast<double>(rec.high) * 1e-9; break;
+			case COL_LOW:      p_dbl[i][n] = static_cast<double>(rec.low) * 1e-9; break;
+			case COL_CLOSE:    p_dbl[i][n] = static_cast<double>(rec.close) * 1e-9; break;
+			case COL_VOLUME:   p_u64[i][n] = rec.volume; break;
+			default: break;
+			}
+		}
 		++n;
 	}
 	out.SetCardinality(n);
@@ -644,30 +1293,60 @@ static unique_ptr<FunctionData> StatusBind(ClientContext &context, TableFunction
 
 static void StatusScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[2]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[3]);
-	auto action = FlatVector::GetData<uint16_t>(out.data[4]);
-	auto reason = FlatVector::GetData<uint16_t>(out.data[5]);
-	auto trading_event = FlatVector::GetData<uint16_t>(out.data[6]);
-	auto is_trading = FlatVector::GetData<string_t>(out.data[7]);
-	auto is_quoting = FlatVector::GetData<string_t>(out.data[8]);
-	auto is_ssr = FlatVector::GetData<string_t>(out.data[9]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0, COL_TS_RECV = 1, COL_INSTR = 2, COL_PUB = 3,
+		COL_ACTION = 4,   COL_REASON = 5,  COL_TRADING_EVENT = 6,
+		COL_IS_TRADING = 7, COL_IS_QUOTING = 8, COL_IS_SSR = 9,
+	};
+
+	std::array<int64_t *,  16> p_i64 {};
+	std::array<uint32_t *, 16> p_u32 {};
+	std::array<uint16_t *, 16> p_u16 {};
+	std::array<string_t *, 16> p_str {};
+	D_ASSERT(projected_count <= 16);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT:       p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_RECV:        p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:          p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:            p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_ACTION:         p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_REASON:         p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_TRADING_EVENT:  p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_IS_TRADING:     p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_IS_QUOTING:     p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_IS_SSR:         p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		default: break;
+		}
+	}
 
 	databento::StatusMsg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Status)) {
-		ts_event[n] = TsToInt64(rec.hd.ts_event);
-		ts_recv[n] = TsToInt64(rec.ts_recv);
-		instr[n] = rec.hd.instrument_id;
-		pub[n] = rec.hd.publisher_id;
-		action[n] = static_cast<uint16_t>(rec.action);
-		reason[n] = static_cast<uint16_t>(rec.reason);
-		trading_event[n] = static_cast<uint16_t>(rec.trading_event);
-		is_trading[n] = duckdb_dbn::EmitChar1(out.data[7], static_cast<char>(rec.is_trading));
-		is_quoting[n] = duckdb_dbn::EmitChar1(out.data[8], static_cast<char>(rec.is_quoting));
-		is_ssr[n] = duckdb_dbn::EmitChar1(out.data[9], static_cast<char>(rec.is_short_sell_restricted));
+		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT:      p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+			case COL_TS_RECV:       p_i64[i][n] = TsToInt64(rec.ts_recv); break;
+			case COL_INSTR:         p_u32[i][n] = rec.hd.instrument_id; break;
+			case COL_PUB:           p_u16[i][n] = rec.hd.publisher_id; break;
+			case COL_ACTION:        p_u16[i][n] = static_cast<uint16_t>(rec.action); break;
+			case COL_REASON:        p_u16[i][n] = static_cast<uint16_t>(rec.reason); break;
+			case COL_TRADING_EVENT: p_u16[i][n] = static_cast<uint16_t>(rec.trading_event); break;
+			case COL_IS_TRADING:    p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.is_trading)); break;
+			case COL_IS_QUOTING:    p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.is_quoting)); break;
+			case COL_IS_SSR:        p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.is_short_sell_restricted)); break;
+			default: break;
+			}
+		}
 		++n;
 	}
 	out.SetCardinality(n);
@@ -718,56 +1397,91 @@ static unique_ptr<FunctionData> ImbalanceBind(ClientContext &context, TableFunct
 
 static void ImbalanceScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[2]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[3]);
-	auto ref_px = FlatVector::GetData<double>(out.data[4]);
-	auto auc_time = FlatVector::GetData<int64_t>(out.data[5]);
-	auto cont_clr = FlatVector::GetData<double>(out.data[6]);
-	auto auct_int_clr = FlatVector::GetData<double>(out.data[7]);
-	auto ssr_fill = FlatVector::GetData<double>(out.data[8]);
-	auto ind_match = FlatVector::GetData<double>(out.data[9]);
-	auto upper_collar = FlatVector::GetData<double>(out.data[10]);
-	auto lower_collar = FlatVector::GetData<double>(out.data[11]);
-	auto paired_qty = FlatVector::GetData<uint32_t>(out.data[12]);
-	auto total_imb = FlatVector::GetData<uint32_t>(out.data[13]);
-	auto mkt_imb = FlatVector::GetData<uint32_t>(out.data[14]);
-	auto unpaired_qty = FlatVector::GetData<uint32_t>(out.data[15]);
-	auto auc_type = FlatVector::GetData<string_t>(out.data[16]);
-	auto side_v = FlatVector::GetData<string_t>(out.data[17]);
-	auto auc_status = FlatVector::GetData<uint8_t>(out.data[18]);
-	auto freeze = FlatVector::GetData<uint8_t>(out.data[19]);
-	auto num_ext = FlatVector::GetData<uint8_t>(out.data[20]);
-	auto unp_side = FlatVector::GetData<string_t>(out.data[21]);
-	auto sig_imb = FlatVector::GetData<string_t>(out.data[22]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0,    COL_TS_RECV = 1,            COL_INSTR = 2,           COL_PUB = 3,
+		COL_REF_PRICE = 4,   COL_AUCTION_TIME = 5,       COL_CONT_CLR = 6,        COL_AUCT_INT_CLR = 7,
+		COL_SSR_FILL = 8,    COL_IND_MATCH = 9,          COL_UPPER_COLLAR = 10,   COL_LOWER_COLLAR = 11,
+		COL_PAIRED_QTY = 12, COL_TOTAL_IMB = 13,         COL_MKT_IMB = 14,        COL_UNPAIRED_QTY = 15,
+		COL_AUC_TYPE = 16,   COL_SIDE = 17,              COL_AUC_STATUS = 18,     COL_FREEZE = 19,
+		COL_NUM_EXT = 20,    COL_UNP_SIDE = 21,          COL_SIG_IMB = 22,
+	};
+
+	std::array<int64_t *,  32> p_i64 {};
+	std::array<uint32_t *, 32> p_u32 {};
+	std::array<uint16_t *, 32> p_u16 {};
+	std::array<double *,   32> p_dbl {};
+	std::array<string_t *, 32> p_str {};
+	std::array<uint8_t *,  32> p_u8  {};
+	D_ASSERT(projected_count <= 32);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT:       p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_RECV:        p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:          p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:            p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_REF_PRICE:      p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_AUCTION_TIME:   p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_CONT_CLR:       p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_AUCT_INT_CLR:   p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_SSR_FILL:       p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_IND_MATCH:      p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_UPPER_COLLAR:   p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_LOWER_COLLAR:   p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_PAIRED_QTY:     p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_TOTAL_IMB:      p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_MKT_IMB:        p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_UNPAIRED_QTY:   p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_AUC_TYPE:       p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_SIDE:           p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_AUC_STATUS:     p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_FREEZE:         p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_NUM_EXT:        p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_UNP_SIDE:       p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_SIG_IMB:        p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		default: break;
+		}
+	}
 
 	databento::ImbalanceMsg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Imbalance)) {
-		ts_event[n] = TsToInt64(rec.hd.ts_event);
-		ts_recv[n] = TsToInt64(rec.ts_recv);
-		instr[n] = rec.hd.instrument_id;
-		pub[n] = rec.hd.publisher_id;
-		ref_px[n] = static_cast<double>(rec.ref_price) * 1e-9;
-		auc_time[n] = TsToInt64(rec.auction_time);
-		cont_clr[n] = static_cast<double>(rec.cont_book_clr_price) * 1e-9;
-		auct_int_clr[n] = static_cast<double>(rec.auct_interest_clr_price) * 1e-9;
-		ssr_fill[n] = static_cast<double>(rec.ssr_filling_price) * 1e-9;
-		ind_match[n] = static_cast<double>(rec.ind_match_price) * 1e-9;
-		upper_collar[n] = static_cast<double>(rec.upper_collar) * 1e-9;
-		lower_collar[n] = static_cast<double>(rec.lower_collar) * 1e-9;
-		paired_qty[n] = rec.paired_qty;
-		total_imb[n] = rec.total_imbalance_qty;
-		mkt_imb[n] = rec.market_imbalance_qty;
-		unpaired_qty[n] = rec.unpaired_qty;
-		auc_type[n] = duckdb_dbn::EmitChar1(out.data[16], rec.auction_type);
-		side_v[n] = duckdb_dbn::EmitChar1(out.data[17], static_cast<char>(rec.side));
-		auc_status[n] = rec.auction_status;
-		freeze[n] = rec.freeze_status;
-		num_ext[n] = rec.num_extensions;
-		unp_side[n] = duckdb_dbn::EmitChar1(out.data[21], static_cast<char>(rec.unpaired_side));
-		sig_imb[n] = duckdb_dbn::EmitChar1(out.data[22], rec.significant_imbalance);
+		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT:      p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+			case COL_TS_RECV:       p_i64[i][n] = TsToInt64(rec.ts_recv); break;
+			case COL_INSTR:         p_u32[i][n] = rec.hd.instrument_id; break;
+			case COL_PUB:           p_u16[i][n] = rec.hd.publisher_id; break;
+			case COL_REF_PRICE:     p_dbl[i][n] = static_cast<double>(rec.ref_price) * 1e-9; break;
+			case COL_AUCTION_TIME:  p_i64[i][n] = TsToInt64(rec.auction_time); break;
+			case COL_CONT_CLR:      p_dbl[i][n] = static_cast<double>(rec.cont_book_clr_price) * 1e-9; break;
+			case COL_AUCT_INT_CLR:  p_dbl[i][n] = static_cast<double>(rec.auct_interest_clr_price) * 1e-9; break;
+			case COL_SSR_FILL:      p_dbl[i][n] = static_cast<double>(rec.ssr_filling_price) * 1e-9; break;
+			case COL_IND_MATCH:     p_dbl[i][n] = static_cast<double>(rec.ind_match_price) * 1e-9; break;
+			case COL_UPPER_COLLAR:  p_dbl[i][n] = static_cast<double>(rec.upper_collar) * 1e-9; break;
+			case COL_LOWER_COLLAR:  p_dbl[i][n] = static_cast<double>(rec.lower_collar) * 1e-9; break;
+			case COL_PAIRED_QTY:    p_u32[i][n] = rec.paired_qty; break;
+			case COL_TOTAL_IMB:     p_u32[i][n] = rec.total_imbalance_qty; break;
+			case COL_MKT_IMB:       p_u32[i][n] = rec.market_imbalance_qty; break;
+			case COL_UNPAIRED_QTY:  p_u32[i][n] = rec.unpaired_qty; break;
+			case COL_AUC_TYPE:      p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], rec.auction_type); break;
+			case COL_SIDE:          p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
+			case COL_AUC_STATUS:    p_u8[i][n]  = rec.auction_status; break;
+			case COL_FREEZE:        p_u8[i][n]  = rec.freeze_status; break;
+			case COL_NUM_EXT:       p_u8[i][n]  = rec.num_extensions; break;
+			case COL_UNP_SIDE:      p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.unpaired_side)); break;
+			case COL_SIG_IMB:       p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], rec.significant_imbalance); break;
+			default: break;
+			}
+		}
 		++n;
 	}
 	out.SetCardinality(n);
@@ -785,6 +1499,7 @@ static unique_ptr<FunctionData> StatisticsBind(ClientContext &context, TableFunc
                                                vector<LogicalType> &return_types, vector<string> &names) {
 	auto bd = make_uniq<ReadDbnBindData>();
 	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
+	bd->header_layout = DbnHeaderColumnLayout{0, 3, 4};
 	names = {"ts_event",   "ts_recv",       "ts_ref",      "instrument_id", "publisher_id",
 	         "price",      "quantity",      "sequence",    "ts_in_delta",   "stat_type",
 	         "channel_id", "update_action", "stat_flags"};
@@ -798,19 +1513,54 @@ static unique_ptr<FunctionData> StatisticsBind(ClientContext &context, TableFunc
 
 static void StatisticsScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	auto ts_event = FlatVector::GetData<int64_t>(out.data[0]);
-	auto ts_recv = FlatVector::GetData<int64_t>(out.data[1]);
-	auto ts_ref = FlatVector::GetData<int64_t>(out.data[2]);
-	auto instr = FlatVector::GetData<uint32_t>(out.data[3]);
-	auto pub = FlatVector::GetData<uint16_t>(out.data[4]);
-	auto price = FlatVector::GetData<double>(out.data[5]);
-	auto quantity = FlatVector::GetData<int64_t>(out.data[6]);
-	auto seq = FlatVector::GetData<uint32_t>(out.data[7]);
-	auto ts_in_d = FlatVector::GetData<int32_t>(out.data[8]);
-	auto stat_type = FlatVector::GetData<uint16_t>(out.data[9]);
-	auto chan = FlatVector::GetData<uint16_t>(out.data[10]);
-	auto update_action = FlatVector::GetData<uint8_t>(out.data[11]);
-	auto stat_flags = FlatVector::GetData<uint8_t>(out.data[12]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT      = 0,
+		COL_TS_RECV       = 1,
+		COL_TS_REF        = 2,
+		COL_INSTR         = 3,
+		COL_PUB           = 4,
+		COL_PRICE         = 5,
+		COL_QUANTITY      = 6,
+		COL_SEQUENCE      = 7,
+		COL_TS_IN_DELTA   = 8,
+		COL_STAT_TYPE     = 9,
+		COL_CHANNEL_ID    = 10,
+		COL_UPDATE_ACTION = 11,
+		COL_STAT_FLAGS    = 12,
+	};
+
+	std::array<int64_t *,  16> p_i64 {};
+	std::array<uint32_t *, 16> p_u32 {};
+	std::array<uint16_t *, 16> p_u16 {};
+	std::array<double *,   16> p_dbl {};
+	std::array<int32_t *,  16> p_i32 {};
+	std::array<uint8_t *,  16> p_u8  {};
+	D_ASSERT(projected_count <= 16);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT:      p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_RECV:       p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_TS_REF:        p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:         p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:           p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_PRICE:         p_dbl[i] = FlatVector::GetData<double>(out.data[i]); break;
+		case COL_QUANTITY:      p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_SEQUENCE:      p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_TS_IN_DELTA:   p_i32[i] = FlatVector::GetData<int32_t>(out.data[i]); break;
+		case COL_STAT_TYPE:     p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_CHANNEL_ID:    p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_UPDATE_ACTION: p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_STAT_FLAGS:    p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		default: break;
+		}
+	}
 
 	const auto version = st.reader->Version();
 	const bool use_v1 = (version == 1 || version == 2);
@@ -819,43 +1569,57 @@ static void StatisticsScan(ClientContext &, TableFunctionInput &input, DataChunk
 	if (use_v1) {
 		databento::v1::StatMsg rec {};
 		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Statistics)) {
-			ts_event[n] = TsToInt64(rec.hd.ts_event);
-			ts_recv[n] = TsToInt64(rec.ts_recv);
-			ts_ref[n] = TsToInt64(rec.ts_ref);
-			instr[n] = rec.hd.instrument_id;
-			pub[n] = rec.hd.publisher_id;
-			price[n] = static_cast<double>(rec.price) * 1e-9;
-			// Sign-extend quantity, mapping the v1 UNDEF sentinel (INT32_MAX) to
-			// the v3 sentinel (INT64_MAX) so consumers can treat the column uniformly.
-			if (rec.quantity == std::numeric_limits<std::int32_t>::max()) {
-				quantity[n] = std::numeric_limits<std::int64_t>::max();
-			} else {
-				quantity[n] = static_cast<int64_t>(rec.quantity);
+			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			for (idx_t i = 0; i < projected_count; ++i) {
+				const auto cid = col_ids[i];
+				switch (cid) {
+				case COL_TS_EVENT:      p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+				case COL_TS_RECV:       p_i64[i][n] = TsToInt64(rec.ts_recv); break;
+				case COL_TS_REF:        p_i64[i][n] = TsToInt64(rec.ts_ref); break;
+				case COL_INSTR:         p_u32[i][n] = rec.hd.instrument_id; break;
+				case COL_PUB:           p_u16[i][n] = rec.hd.publisher_id; break;
+				case COL_PRICE:         p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+				case COL_QUANTITY:
+					if (rec.quantity == std::numeric_limits<std::int32_t>::max()) {
+						p_i64[i][n] = std::numeric_limits<std::int64_t>::max();
+					} else {
+						p_i64[i][n] = static_cast<int64_t>(rec.quantity);
+					}
+					break;
+				case COL_SEQUENCE:      p_u32[i][n] = rec.sequence; break;
+				case COL_TS_IN_DELTA:   p_i32[i][n] = static_cast<int32_t>(rec.ts_in_delta.count()); break;
+				case COL_STAT_TYPE:     p_u16[i][n] = static_cast<uint16_t>(rec.stat_type); break;
+				case COL_CHANNEL_ID:    p_u16[i][n] = rec.channel_id; break;
+				case COL_UPDATE_ACTION: p_u8[i][n]  = static_cast<uint8_t>(rec.update_action); break;
+				case COL_STAT_FLAGS:    p_u8[i][n]  = rec.stat_flags; break;
+				default: break;
+				}
 			}
-			seq[n] = rec.sequence;
-			ts_in_d[n] = static_cast<int32_t>(rec.ts_in_delta.count());
-			stat_type[n] = static_cast<uint16_t>(rec.stat_type);
-			chan[n] = rec.channel_id;
-			update_action[n] = static_cast<uint8_t>(rec.update_action);
-			stat_flags[n] = rec.stat_flags;
 			++n;
 		}
 	} else {
 		databento::StatMsg rec {};
 		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Statistics)) {
-			ts_event[n] = TsToInt64(rec.hd.ts_event);
-			ts_recv[n] = TsToInt64(rec.ts_recv);
-			ts_ref[n] = TsToInt64(rec.ts_ref);
-			instr[n] = rec.hd.instrument_id;
-			pub[n] = rec.hd.publisher_id;
-			price[n] = static_cast<double>(rec.price) * 1e-9;
-			quantity[n] = rec.quantity;
-			seq[n] = rec.sequence;
-			ts_in_d[n] = static_cast<int32_t>(rec.ts_in_delta.count());
-			stat_type[n] = static_cast<uint16_t>(rec.stat_type);
-			chan[n] = rec.channel_id;
-			update_action[n] = static_cast<uint8_t>(rec.update_action);
-			stat_flags[n] = rec.stat_flags;
+			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			for (idx_t i = 0; i < projected_count; ++i) {
+				const auto cid = col_ids[i];
+				switch (cid) {
+				case COL_TS_EVENT:      p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+				case COL_TS_RECV:       p_i64[i][n] = TsToInt64(rec.ts_recv); break;
+				case COL_TS_REF:        p_i64[i][n] = TsToInt64(rec.ts_ref); break;
+				case COL_INSTR:         p_u32[i][n] = rec.hd.instrument_id; break;
+				case COL_PUB:           p_u16[i][n] = rec.hd.publisher_id; break;
+				case COL_PRICE:         p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+				case COL_QUANTITY:      p_i64[i][n] = rec.quantity; break;
+				case COL_SEQUENCE:      p_u32[i][n] = rec.sequence; break;
+				case COL_TS_IN_DELTA:   p_i32[i][n] = static_cast<int32_t>(rec.ts_in_delta.count()); break;
+				case COL_STAT_TYPE:     p_u16[i][n] = static_cast<uint16_t>(rec.stat_type); break;
+				case COL_CHANNEL_ID:    p_u16[i][n] = rec.channel_id; break;
+				case COL_UPDATE_ACTION: p_u8[i][n]  = static_cast<uint8_t>(rec.update_action); break;
+				case COL_STAT_FLAGS:    p_u8[i][n]  = rec.stat_flags; break;
+				default: break;
+				}
+			}
 			++n;
 		}
 	}
@@ -926,249 +1690,300 @@ static unique_ptr<FunctionData> DefinitionBind(ClientContext &context, TableFunc
 
 static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0, COL_TS_RECV = 1, COL_INSTR = 2, COL_PUB = 3,
+		COL_RAW_SYMBOL = 4, COL_INSTRUMENT_CLASS = 5, COL_SECURITY_TYPE = 6, COL_EXCHANGE = 7,
+		COL_ASSET = 8, COL_CFI = 9, COL_CURRENCY = 10, COL_SETTL_CURRENCY = 11,
+		COL_SECSUBTYPE = 12, COL_GROUP = 13, COL_UNDERLYING = 14, COL_STRIKE_PRICE_CURRENCY = 15,
+		COL_UNIT_OF_MEASURE = 16, COL_EXPIRATION = 17, COL_ACTIVATION = 18, COL_MIN_PRICE_INCREMENT = 19,
+		COL_DISPLAY_FACTOR = 20, COL_HIGH_LIMIT_PRICE = 21, COL_LOW_LIMIT_PRICE = 22, COL_MAX_PRICE_VARIATION = 23,
+		COL_STRIKE_PRICE = 24, COL_UNIT_OF_MEASURE_QTY = 25, COL_MIN_PRICE_INCREMENT_AMOUNT = 26, COL_PRICE_RATIO = 27,
+		COL_RAW_INSTRUMENT_ID = 28, COL_UNDERLYING_ID = 29, COL_INST_ATTRIB_VALUE = 30, COL_MARKET_DEPTH_IMPLIED = 31,
+		COL_MARKET_DEPTH = 32, COL_MARKET_SEGMENT_ID = 33, COL_MAX_TRADE_VOL = 34, COL_MIN_LOT_SIZE = 35,
+		COL_MIN_LOT_SIZE_BLOCK = 36, COL_MIN_LOT_SIZE_ROUND_LOT = 37, COL_MIN_TRADE_VOL = 38, COL_CONTRACT_MULTIPLIER = 39,
+		COL_DECAY_QUANTITY = 40, COL_ORIGINAL_CONTRACT_SIZE = 41, COL_APPL_ID = 42, COL_MATURITY_YEAR = 43,
+		COL_DECAY_START_DATE = 44, COL_CHANNEL_ID = 45, COL_MATCH_ALGORITHM = 46, COL_MAIN_FRACTION = 47,
+		COL_PRICE_DISPLAY_FORMAT = 48, COL_SUB_FRACTION = 49, COL_UNDERLYING_PRODUCT = 50, COL_SECURITY_UPDATE_ACTION = 51,
+		COL_MATURITY_MONTH = 52, COL_MATURITY_DAY = 53, COL_MATURITY_WEEK = 54, COL_USER_DEFINED_INSTRUMENT = 55,
+		COL_CONTRACT_MULTIPLIER_UNIT = 56, COL_FLOW_SCHEDULE_TYPE = 57, COL_TICK_RULE = 58, COL_LEG_COUNT = 59,
+		COL_LEG_INDEX = 60, COL_LEG_INSTRUMENT_ID = 61, COL_LEG_RAW_SYMBOL = 62, COL_LEG_INSTRUMENT_CLASS = 63,
+		COL_LEG_SIDE = 64, COL_LEG_PRICE = 65, COL_LEG_DELTA = 66, COL_LEG_RATIO_PRICE_NUMERATOR = 67,
+		COL_LEG_RATIO_PRICE_DENOMINATOR = 68, COL_LEG_RATIO_QTY_NUMERATOR = 69, COL_LEG_RATIO_QTY_DENOMINATOR = 70, COL_LEG_UNDERLYING_ID = 71,
+		COL_TRADING_REFERENCE_PRICE = 72, COL_TRADING_REFERENCE_DATE = 73, COL_MD_SECURITY_TRADING_STATUS = 74, COL_SETTL_PRICE_TYPE = 75,
+	};
+
 	const auto version = st.reader->Version();
 	idx_t n = 0;
+
 	if (version >= 3) {
 		databento::InstrumentDefMsg rec {};
 		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::InstrumentDef)) {
-			FlatVector::GetData<int64_t>(out.data[0])[n] = static_cast<int64_t>((rec.hd.ts_event).time_since_epoch().count());
-			FlatVector::GetData<int64_t>(out.data[1])[n] = static_cast<int64_t>((rec.ts_recv).time_since_epoch().count());
-			FlatVector::GetData<uint32_t>(out.data[2])[n] = rec.hd.instrument_id;
-			FlatVector::GetData<uint16_t>(out.data[3])[n] = rec.hd.publisher_id;
-			FlatVector::GetData<string_t>(out.data[4])[n] = duckdb_dbn::EmitCstr(out.data[4], rec.RawSymbol(), 64);
-			FlatVector::GetData<string_t>(out.data[5])[n] = duckdb_dbn::EmitChar1(out.data[5], static_cast<char>(rec.instrument_class));
-			FlatVector::GetData<string_t>(out.data[6])[n] = duckdb_dbn::EmitCstr(out.data[6], rec.SecurityType(), 7);
-			FlatVector::GetData<string_t>(out.data[7])[n] = duckdb_dbn::EmitCstr(out.data[7], rec.Exchange(), 5);
-			FlatVector::GetData<string_t>(out.data[8])[n] = duckdb_dbn::EmitCstr(out.data[8], rec.Asset(), 11);
-			FlatVector::GetData<string_t>(out.data[9])[n] = duckdb_dbn::EmitCstr(out.data[9], rec.Cfi(), 7);
-			FlatVector::GetData<string_t>(out.data[10])[n] = duckdb_dbn::EmitCstr(out.data[10], rec.Currency(), 4);
-			FlatVector::GetData<string_t>(out.data[11])[n] = duckdb_dbn::EmitCstr(out.data[11], rec.SettlCurrency(), 4);
-			FlatVector::GetData<string_t>(out.data[12])[n] = duckdb_dbn::EmitCstr(out.data[12], rec.SecSubType(), 6);
-			FlatVector::GetData<string_t>(out.data[13])[n] = duckdb_dbn::EmitCstr(out.data[13], rec.Group(), 21);
-			FlatVector::GetData<string_t>(out.data[14])[n] = duckdb_dbn::EmitCstr(out.data[14], rec.Underlying(), 21);
-			FlatVector::GetData<string_t>(out.data[15])[n] = duckdb_dbn::EmitCstr(out.data[15], rec.StrikePriceCurrency(), 4);
-			FlatVector::GetData<string_t>(out.data[16])[n] = duckdb_dbn::EmitCstr(out.data[16], rec.UnitOfMeasure(), 31);
-			FlatVector::GetData<int64_t>(out.data[17])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count());
-			FlatVector::GetData<int64_t>(out.data[18])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count());
-			FlatVector::GetData<double>(out.data[19])[n] = static_cast<double>(rec.min_price_increment) * 1e-9;
-			FlatVector::GetData<double>(out.data[20])[n] = static_cast<double>(rec.display_factor) * 1e-9;
-			FlatVector::GetData<double>(out.data[21])[n] = static_cast<double>(rec.high_limit_price) * 1e-9;
-			FlatVector::GetData<double>(out.data[22])[n] = static_cast<double>(rec.low_limit_price) * 1e-9;
-			FlatVector::GetData<double>(out.data[23])[n] = static_cast<double>(rec.max_price_variation) * 1e-9;
-			FlatVector::GetData<double>(out.data[24])[n] = static_cast<double>(rec.strike_price) * 1e-9;
-			FlatVector::GetData<double>(out.data[25])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9;
-			FlatVector::GetData<double>(out.data[26])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9;
-			FlatVector::GetData<double>(out.data[27])[n] = static_cast<double>(rec.price_ratio) * 1e-9;
-			FlatVector::GetData<uint64_t>(out.data[28])[n] = rec.raw_instrument_id;
-			FlatVector::GetData<uint32_t>(out.data[29])[n] = rec.underlying_id;
-			FlatVector::GetData<int32_t>(out.data[30])[n] = rec.inst_attrib_value;
-			FlatVector::GetData<int32_t>(out.data[31])[n] = rec.market_depth_implied;
-			FlatVector::GetData<int32_t>(out.data[32])[n] = rec.market_depth;
-			FlatVector::GetData<uint32_t>(out.data[33])[n] = rec.market_segment_id;
-			FlatVector::GetData<uint32_t>(out.data[34])[n] = rec.max_trade_vol;
-			FlatVector::GetData<int32_t>(out.data[35])[n] = rec.min_lot_size;
-			FlatVector::GetData<int32_t>(out.data[36])[n] = rec.min_lot_size_block;
-			FlatVector::GetData<int32_t>(out.data[37])[n] = rec.min_lot_size_round_lot;
-			FlatVector::GetData<uint32_t>(out.data[38])[n] = rec.min_trade_vol;
-			FlatVector::GetData<int32_t>(out.data[39])[n] = rec.contract_multiplier;
-			FlatVector::GetData<int32_t>(out.data[40])[n] = rec.decay_quantity;
-			FlatVector::GetData<int32_t>(out.data[41])[n] = rec.original_contract_size;
-			FlatVector::GetData<int16_t>(out.data[42])[n] = rec.appl_id;
-			FlatVector::GetData<uint16_t>(out.data[43])[n] = rec.maturity_year;
-			FlatVector::GetData<uint16_t>(out.data[44])[n] = rec.decay_start_date;
-			FlatVector::GetData<uint16_t>(out.data[45])[n] = rec.channel_id;
-			FlatVector::GetData<string_t>(out.data[46])[n] = duckdb_dbn::EmitChar1(out.data[46], static_cast<char>(rec.match_algorithm));
-			FlatVector::GetData<uint8_t>(out.data[47])[n] = rec.main_fraction;
-			FlatVector::GetData<uint8_t>(out.data[48])[n] = rec.price_display_format;
-			FlatVector::GetData<uint8_t>(out.data[49])[n] = rec.sub_fraction;
-			FlatVector::GetData<uint8_t>(out.data[50])[n] = rec.underlying_product;
-			FlatVector::GetData<string_t>(out.data[51])[n] = duckdb_dbn::EmitChar1(out.data[51], static_cast<char>(rec.security_update_action));
-			FlatVector::GetData<uint8_t>(out.data[52])[n] = rec.maturity_month;
-			FlatVector::GetData<uint8_t>(out.data[53])[n] = rec.maturity_day;
-			FlatVector::GetData<uint8_t>(out.data[54])[n] = rec.maturity_week;
-			FlatVector::GetData<string_t>(out.data[55])[n] = duckdb_dbn::EmitChar1(out.data[55], static_cast<char>(rec.user_defined_instrument));
-			FlatVector::GetData<int8_t>(out.data[56])[n] = static_cast<int8_t>(rec.contract_multiplier_unit);
-			FlatVector::GetData<int8_t>(out.data[57])[n] = static_cast<int8_t>(rec.flow_schedule_type);
-			FlatVector::GetData<uint8_t>(out.data[58])[n] = rec.tick_rule;
-			FlatVector::GetData<uint16_t>(out.data[59])[n] = rec.leg_count;
-			FlatVector::GetData<uint16_t>(out.data[60])[n] = rec.leg_index;
-			FlatVector::GetData<uint32_t>(out.data[61])[n] = rec.leg_instrument_id;
-			FlatVector::GetData<string_t>(out.data[62])[n] = duckdb_dbn::EmitCstr(out.data[62], rec.LegRawSymbol(), 64);
-			FlatVector::GetData<string_t>(out.data[63])[n] = duckdb_dbn::EmitChar1(out.data[63], static_cast<char>(rec.leg_instrument_class));
-			FlatVector::GetData<string_t>(out.data[64])[n] = duckdb_dbn::EmitChar1(out.data[64], static_cast<char>(rec.leg_side));
-			FlatVector::GetData<double>(out.data[65])[n] = static_cast<double>(rec.leg_price) * 1e-9;
-			FlatVector::GetData<double>(out.data[66])[n] = static_cast<double>(rec.leg_delta) * 1e-9;
-			FlatVector::GetData<int32_t>(out.data[67])[n] = rec.leg_ratio_price_numerator;
-			FlatVector::GetData<int32_t>(out.data[68])[n] = rec.leg_ratio_price_denominator;
-			FlatVector::GetData<int32_t>(out.data[69])[n] = rec.leg_ratio_qty_numerator;
-			FlatVector::GetData<int32_t>(out.data[70])[n] = rec.leg_ratio_qty_denominator;
-			FlatVector::GetData<uint32_t>(out.data[71])[n] = rec.leg_underlying_id;
-			FlatVector::Validity(out.data[72]).SetInvalid(n);
-			FlatVector::Validity(out.data[73]).SetInvalid(n);
-			FlatVector::Validity(out.data[74]).SetInvalid(n);
-			FlatVector::Validity(out.data[75]).SetInvalid(n);
+			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			for (idx_t i = 0; i < projected_count; ++i) {
+				const auto cid = col_ids[i];
+				switch (cid) {
+				case COL_TS_EVENT: FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.hd.ts_event).time_since_epoch().count()); break;
+				case COL_TS_RECV:  FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.ts_recv).time_since_epoch().count()); break;
+				case COL_INSTR:    FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.hd.instrument_id; break;
+				case COL_PUB:      FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.hd.publisher_id; break;
+				case COL_RAW_SYMBOL:         FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.RawSymbol(), 64); break;
+				case COL_INSTRUMENT_CLASS:   FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.instrument_class)); break;
+				case COL_SECURITY_TYPE:      FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.SecurityType(), 7); break;
+				case COL_EXCHANGE:           FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Exchange(), 5); break;
+				case COL_ASSET:              FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Asset(), 11); break;
+				case COL_CFI:                FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Cfi(), 7); break;
+				case COL_CURRENCY:           FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Currency(), 4); break;
+				case COL_SETTL_CURRENCY:     FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.SettlCurrency(), 4); break;
+				case COL_SECSUBTYPE:         FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.SecSubType(), 6); break;
+				case COL_GROUP:              FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Group(), 21); break;
+				case COL_UNDERLYING:         FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Underlying(), 21); break;
+				case COL_STRIKE_PRICE_CURRENCY: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.StrikePriceCurrency(), 4); break;
+				case COL_UNIT_OF_MEASURE:    FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.UnitOfMeasure(), 31); break;
+				case COL_EXPIRATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count()); break;
+				case COL_ACTIVATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count()); break;
+				case COL_MIN_PRICE_INCREMENT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment) * 1e-9; break;
+				case COL_DISPLAY_FACTOR:     FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.display_factor) * 1e-9; break;
+				case COL_HIGH_LIMIT_PRICE:   FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.high_limit_price) * 1e-9; break;
+				case COL_LOW_LIMIT_PRICE:    FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.low_limit_price) * 1e-9; break;
+				case COL_MAX_PRICE_VARIATION: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.max_price_variation) * 1e-9; break;
+				case COL_STRIKE_PRICE:       FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.strike_price) * 1e-9; break;
+				case COL_UNIT_OF_MEASURE_QTY: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9; break;
+				case COL_MIN_PRICE_INCREMENT_AMOUNT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9; break;
+				case COL_PRICE_RATIO:        FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.price_ratio) * 1e-9; break;
+				case COL_RAW_INSTRUMENT_ID:  FlatVector::GetData<uint64_t>(out.data[i])[n] = rec.raw_instrument_id; break;
+				case COL_UNDERLYING_ID:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.underlying_id; break;
+				case COL_INST_ATTRIB_VALUE:  FlatVector::GetData<int32_t>(out.data[i])[n] = rec.inst_attrib_value; break;
+				case COL_MARKET_DEPTH_IMPLIED: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.market_depth_implied; break;
+				case COL_MARKET_DEPTH:       FlatVector::GetData<int32_t>(out.data[i])[n] = rec.market_depth; break;
+				case COL_MARKET_SEGMENT_ID:  FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.market_segment_id; break;
+				case COL_MAX_TRADE_VOL:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.max_trade_vol; break;
+				case COL_MIN_LOT_SIZE:       FlatVector::GetData<int32_t>(out.data[i])[n] = rec.min_lot_size; break;
+				case COL_MIN_LOT_SIZE_BLOCK: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.min_lot_size_block; break;
+				case COL_MIN_LOT_SIZE_ROUND_LOT: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.min_lot_size_round_lot; break;
+				case COL_MIN_TRADE_VOL:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.min_trade_vol; break;
+				case COL_CONTRACT_MULTIPLIER: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.contract_multiplier; break;
+				case COL_DECAY_QUANTITY:     FlatVector::GetData<int32_t>(out.data[i])[n] = rec.decay_quantity; break;
+				case COL_ORIGINAL_CONTRACT_SIZE: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.original_contract_size; break;
+				case COL_APPL_ID:            FlatVector::GetData<int16_t>(out.data[i])[n] = rec.appl_id; break;
+				case COL_MATURITY_YEAR:      FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.maturity_year; break;
+				case COL_DECAY_START_DATE:   FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.decay_start_date; break;
+				case COL_CHANNEL_ID:         FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.channel_id; break;
+				case COL_MATCH_ALGORITHM:    FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.match_algorithm)); break;
+				case COL_MAIN_FRACTION:      FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.main_fraction; break;
+				case COL_PRICE_DISPLAY_FORMAT: FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.price_display_format; break;
+				case COL_SUB_FRACTION:       FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.sub_fraction; break;
+				case COL_UNDERLYING_PRODUCT: FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.underlying_product; break;
+				case COL_SECURITY_UPDATE_ACTION: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.security_update_action)); break;
+				case COL_MATURITY_MONTH:     FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.maturity_month; break;
+				case COL_MATURITY_DAY:       FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.maturity_day; break;
+				case COL_MATURITY_WEEK:      FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.maturity_week; break;
+				case COL_USER_DEFINED_INSTRUMENT: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.user_defined_instrument)); break;
+				case COL_CONTRACT_MULTIPLIER_UNIT: FlatVector::GetData<int8_t>(out.data[i])[n] = static_cast<int8_t>(rec.contract_multiplier_unit); break;
+				case COL_FLOW_SCHEDULE_TYPE: FlatVector::GetData<int8_t>(out.data[i])[n] = static_cast<int8_t>(rec.flow_schedule_type); break;
+				case COL_TICK_RULE:          FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.tick_rule; break;
+				case COL_LEG_COUNT:          FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.leg_count; break;
+				case COL_LEG_INDEX:          FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.leg_index; break;
+				case COL_LEG_INSTRUMENT_ID:  FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.leg_instrument_id; break;
+				case COL_LEG_RAW_SYMBOL:     FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.LegRawSymbol(), 64); break;
+				case COL_LEG_INSTRUMENT_CLASS: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.leg_instrument_class)); break;
+				case COL_LEG_SIDE:           FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.leg_side)); break;
+				case COL_LEG_PRICE:          FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.leg_price) * 1e-9; break;
+				case COL_LEG_DELTA:          FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.leg_delta) * 1e-9; break;
+				case COL_LEG_RATIO_PRICE_NUMERATOR:   FlatVector::GetData<int32_t>(out.data[i])[n] = rec.leg_ratio_price_numerator; break;
+				case COL_LEG_RATIO_PRICE_DENOMINATOR: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.leg_ratio_price_denominator; break;
+				case COL_LEG_RATIO_QTY_NUMERATOR:     FlatVector::GetData<int32_t>(out.data[i])[n] = rec.leg_ratio_qty_numerator; break;
+				case COL_LEG_RATIO_QTY_DENOMINATOR:   FlatVector::GetData<int32_t>(out.data[i])[n] = rec.leg_ratio_qty_denominator; break;
+				case COL_LEG_UNDERLYING_ID:           FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.leg_underlying_id; break;
+				case COL_TRADING_REFERENCE_PRICE:
+				case COL_TRADING_REFERENCE_DATE:
+				case COL_MD_SECURITY_TRADING_STATUS:
+				case COL_SETTL_PRICE_TYPE:
+					FlatVector::Validity(out.data[i]).SetInvalid(n); break;
+				default: break;
+				}
+			}
 			++n;
 		}
 	} else if (version == 2) {
 		databento::v2::InstrumentDefMsg rec {};
 		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::InstrumentDef)) {
-			FlatVector::GetData<int64_t>(out.data[0])[n] = static_cast<int64_t>((rec.hd.ts_event).time_since_epoch().count());
-			FlatVector::GetData<int64_t>(out.data[1])[n] = static_cast<int64_t>((rec.ts_recv).time_since_epoch().count());
-			FlatVector::GetData<uint32_t>(out.data[2])[n] = rec.hd.instrument_id;
-			FlatVector::GetData<uint16_t>(out.data[3])[n] = rec.hd.publisher_id;
-			FlatVector::GetData<string_t>(out.data[4])[n] = duckdb_dbn::EmitCstr(out.data[4], rec.RawSymbol(), 64);
-			FlatVector::GetData<string_t>(out.data[5])[n] = duckdb_dbn::EmitChar1(out.data[5], static_cast<char>(rec.instrument_class));
-			FlatVector::GetData<string_t>(out.data[6])[n] = duckdb_dbn::EmitCstr(out.data[6], rec.SecurityType(), 7);
-			FlatVector::GetData<string_t>(out.data[7])[n] = duckdb_dbn::EmitCstr(out.data[7], rec.Exchange(), 5);
-			FlatVector::GetData<string_t>(out.data[8])[n] = duckdb_dbn::EmitCstr(out.data[8], rec.Asset(), 11);
-			FlatVector::GetData<string_t>(out.data[9])[n] = duckdb_dbn::EmitCstr(out.data[9], rec.Cfi(), 7);
-			FlatVector::GetData<string_t>(out.data[10])[n] = duckdb_dbn::EmitCstr(out.data[10], rec.Currency(), 4);
-			FlatVector::GetData<string_t>(out.data[11])[n] = duckdb_dbn::EmitCstr(out.data[11], rec.SettlCurrency(), 4);
-			FlatVector::GetData<string_t>(out.data[12])[n] = duckdb_dbn::EmitCstr(out.data[12], rec.SecSubType(), 6);
-			FlatVector::GetData<string_t>(out.data[13])[n] = duckdb_dbn::EmitCstr(out.data[13], rec.Group(), 21);
-			FlatVector::GetData<string_t>(out.data[14])[n] = duckdb_dbn::EmitCstr(out.data[14], rec.Underlying(), 21);
-			FlatVector::GetData<string_t>(out.data[15])[n] = duckdb_dbn::EmitCstr(out.data[15], rec.StrikePriceCurrency(), 4);
-			FlatVector::GetData<string_t>(out.data[16])[n] = duckdb_dbn::EmitCstr(out.data[16], rec.UnitOfMeasure(), 31);
-			FlatVector::GetData<int64_t>(out.data[17])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count());
-			FlatVector::GetData<int64_t>(out.data[18])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count());
-			FlatVector::GetData<double>(out.data[19])[n] = static_cast<double>(rec.min_price_increment) * 1e-9;
-			FlatVector::GetData<double>(out.data[20])[n] = static_cast<double>(rec.display_factor) * 1e-9;
-			FlatVector::GetData<double>(out.data[21])[n] = static_cast<double>(rec.high_limit_price) * 1e-9;
-			FlatVector::GetData<double>(out.data[22])[n] = static_cast<double>(rec.low_limit_price) * 1e-9;
-			FlatVector::GetData<double>(out.data[23])[n] = static_cast<double>(rec.max_price_variation) * 1e-9;
-			FlatVector::GetData<double>(out.data[24])[n] = static_cast<double>(rec.strike_price) * 1e-9;
-			FlatVector::GetData<double>(out.data[25])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9;
-			FlatVector::GetData<double>(out.data[26])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9;
-			FlatVector::GetData<double>(out.data[27])[n] = static_cast<double>(rec.price_ratio) * 1e-9;
-			FlatVector::GetData<uint64_t>(out.data[28])[n] = static_cast<uint64_t>(rec.raw_instrument_id);
-			FlatVector::GetData<uint32_t>(out.data[29])[n] = rec.underlying_id;
-			FlatVector::GetData<int32_t>(out.data[30])[n] = rec.inst_attrib_value;
-			FlatVector::GetData<int32_t>(out.data[31])[n] = rec.market_depth_implied;
-			FlatVector::GetData<int32_t>(out.data[32])[n] = rec.market_depth;
-			FlatVector::GetData<uint32_t>(out.data[33])[n] = rec.market_segment_id;
-			FlatVector::GetData<uint32_t>(out.data[34])[n] = rec.max_trade_vol;
-			FlatVector::GetData<int32_t>(out.data[35])[n] = rec.min_lot_size;
-			FlatVector::GetData<int32_t>(out.data[36])[n] = rec.min_lot_size_block;
-			FlatVector::GetData<int32_t>(out.data[37])[n] = rec.min_lot_size_round_lot;
-			FlatVector::GetData<uint32_t>(out.data[38])[n] = rec.min_trade_vol;
-			FlatVector::GetData<int32_t>(out.data[39])[n] = rec.contract_multiplier;
-			FlatVector::GetData<int32_t>(out.data[40])[n] = rec.decay_quantity;
-			FlatVector::GetData<int32_t>(out.data[41])[n] = rec.original_contract_size;
-			FlatVector::GetData<int16_t>(out.data[42])[n] = rec.appl_id;
-			FlatVector::GetData<uint16_t>(out.data[43])[n] = rec.maturity_year;
-			FlatVector::GetData<uint16_t>(out.data[44])[n] = rec.decay_start_date;
-			FlatVector::GetData<uint16_t>(out.data[45])[n] = rec.channel_id;
-			FlatVector::GetData<string_t>(out.data[46])[n] = duckdb_dbn::EmitChar1(out.data[46], static_cast<char>(rec.match_algorithm));
-			FlatVector::GetData<uint8_t>(out.data[47])[n] = rec.main_fraction;
-			FlatVector::GetData<uint8_t>(out.data[48])[n] = rec.price_display_format;
-			FlatVector::GetData<uint8_t>(out.data[49])[n] = rec.sub_fraction;
-			FlatVector::GetData<uint8_t>(out.data[50])[n] = rec.underlying_product;
-			FlatVector::GetData<string_t>(out.data[51])[n] = duckdb_dbn::EmitChar1(out.data[51], static_cast<char>(rec.security_update_action));
-			FlatVector::GetData<uint8_t>(out.data[52])[n] = rec.maturity_month;
-			FlatVector::GetData<uint8_t>(out.data[53])[n] = rec.maturity_day;
-			FlatVector::GetData<uint8_t>(out.data[54])[n] = rec.maturity_week;
-			FlatVector::GetData<string_t>(out.data[55])[n] = duckdb_dbn::EmitChar1(out.data[55], static_cast<char>(rec.user_defined_instrument));
-			FlatVector::GetData<int8_t>(out.data[56])[n] = static_cast<int8_t>(rec.contract_multiplier_unit);
-			FlatVector::GetData<int8_t>(out.data[57])[n] = static_cast<int8_t>(rec.flow_schedule_type);
-			FlatVector::GetData<uint8_t>(out.data[58])[n] = rec.tick_rule;
-			FlatVector::Validity(out.data[59]).SetInvalid(n);
-			FlatVector::Validity(out.data[60]).SetInvalid(n);
-			FlatVector::Validity(out.data[61]).SetInvalid(n);
-			FlatVector::Validity(out.data[62]).SetInvalid(n);
-			FlatVector::Validity(out.data[63]).SetInvalid(n);
-			FlatVector::Validity(out.data[64]).SetInvalid(n);
-			FlatVector::Validity(out.data[65]).SetInvalid(n);
-			FlatVector::Validity(out.data[66]).SetInvalid(n);
-			FlatVector::Validity(out.data[67]).SetInvalid(n);
-			FlatVector::Validity(out.data[68]).SetInvalid(n);
-			FlatVector::Validity(out.data[69]).SetInvalid(n);
-			FlatVector::Validity(out.data[70]).SetInvalid(n);
-			FlatVector::Validity(out.data[71]).SetInvalid(n);
-			FlatVector::GetData<double>(out.data[72])[n] = static_cast<double>(rec.trading_reference_price) * 1e-9;
-			FlatVector::GetData<uint16_t>(out.data[73])[n] = rec.trading_reference_date;
-			FlatVector::GetData<uint8_t>(out.data[74])[n] = rec.md_security_trading_status;
-			FlatVector::GetData<uint8_t>(out.data[75])[n] = rec.settl_price_type;
+			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			for (idx_t i = 0; i < projected_count; ++i) {
+				const auto cid = col_ids[i];
+				switch (cid) {
+				case COL_TS_EVENT: FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.hd.ts_event).time_since_epoch().count()); break;
+				case COL_TS_RECV:  FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.ts_recv).time_since_epoch().count()); break;
+				case COL_INSTR:    FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.hd.instrument_id; break;
+				case COL_PUB:      FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.hd.publisher_id; break;
+				case COL_RAW_SYMBOL:         FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.RawSymbol(), 64); break;
+				case COL_INSTRUMENT_CLASS:   FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.instrument_class)); break;
+				case COL_SECURITY_TYPE:      FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.SecurityType(), 7); break;
+				case COL_EXCHANGE:           FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Exchange(), 5); break;
+				case COL_ASSET:              FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Asset(), 11); break;
+				case COL_CFI:                FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Cfi(), 7); break;
+				case COL_CURRENCY:           FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Currency(), 4); break;
+				case COL_SETTL_CURRENCY:     FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.SettlCurrency(), 4); break;
+				case COL_SECSUBTYPE:         FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.SecSubType(), 6); break;
+				case COL_GROUP:              FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Group(), 21); break;
+				case COL_UNDERLYING:         FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Underlying(), 21); break;
+				case COL_STRIKE_PRICE_CURRENCY: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.StrikePriceCurrency(), 4); break;
+				case COL_UNIT_OF_MEASURE:    FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.UnitOfMeasure(), 31); break;
+				case COL_EXPIRATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count()); break;
+				case COL_ACTIVATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count()); break;
+				case COL_MIN_PRICE_INCREMENT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment) * 1e-9; break;
+				case COL_DISPLAY_FACTOR:     FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.display_factor) * 1e-9; break;
+				case COL_HIGH_LIMIT_PRICE:   FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.high_limit_price) * 1e-9; break;
+				case COL_LOW_LIMIT_PRICE:    FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.low_limit_price) * 1e-9; break;
+				case COL_MAX_PRICE_VARIATION: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.max_price_variation) * 1e-9; break;
+				case COL_STRIKE_PRICE:       FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.strike_price) * 1e-9; break;
+				case COL_UNIT_OF_MEASURE_QTY: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9; break;
+				case COL_MIN_PRICE_INCREMENT_AMOUNT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9; break;
+				case COL_PRICE_RATIO:        FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.price_ratio) * 1e-9; break;
+				case COL_RAW_INSTRUMENT_ID:  FlatVector::GetData<uint64_t>(out.data[i])[n] = static_cast<uint64_t>(rec.raw_instrument_id); break;
+				case COL_UNDERLYING_ID:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.underlying_id; break;
+				case COL_INST_ATTRIB_VALUE:  FlatVector::GetData<int32_t>(out.data[i])[n] = rec.inst_attrib_value; break;
+				case COL_MARKET_DEPTH_IMPLIED: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.market_depth_implied; break;
+				case COL_MARKET_DEPTH:       FlatVector::GetData<int32_t>(out.data[i])[n] = rec.market_depth; break;
+				case COL_MARKET_SEGMENT_ID:  FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.market_segment_id; break;
+				case COL_MAX_TRADE_VOL:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.max_trade_vol; break;
+				case COL_MIN_LOT_SIZE:       FlatVector::GetData<int32_t>(out.data[i])[n] = rec.min_lot_size; break;
+				case COL_MIN_LOT_SIZE_BLOCK: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.min_lot_size_block; break;
+				case COL_MIN_LOT_SIZE_ROUND_LOT: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.min_lot_size_round_lot; break;
+				case COL_MIN_TRADE_VOL:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.min_trade_vol; break;
+				case COL_CONTRACT_MULTIPLIER: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.contract_multiplier; break;
+				case COL_DECAY_QUANTITY:     FlatVector::GetData<int32_t>(out.data[i])[n] = rec.decay_quantity; break;
+				case COL_ORIGINAL_CONTRACT_SIZE: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.original_contract_size; break;
+				case COL_APPL_ID:            FlatVector::GetData<int16_t>(out.data[i])[n] = rec.appl_id; break;
+				case COL_MATURITY_YEAR:      FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.maturity_year; break;
+				case COL_DECAY_START_DATE:   FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.decay_start_date; break;
+				case COL_CHANNEL_ID:         FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.channel_id; break;
+				case COL_MATCH_ALGORITHM:    FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.match_algorithm)); break;
+				case COL_MAIN_FRACTION:      FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.main_fraction; break;
+				case COL_PRICE_DISPLAY_FORMAT: FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.price_display_format; break;
+				case COL_SUB_FRACTION:       FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.sub_fraction; break;
+				case COL_UNDERLYING_PRODUCT: FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.underlying_product; break;
+				case COL_SECURITY_UPDATE_ACTION: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.security_update_action)); break;
+				case COL_MATURITY_MONTH:     FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.maturity_month; break;
+				case COL_MATURITY_DAY:       FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.maturity_day; break;
+				case COL_MATURITY_WEEK:      FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.maturity_week; break;
+				case COL_USER_DEFINED_INSTRUMENT: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.user_defined_instrument)); break;
+				case COL_CONTRACT_MULTIPLIER_UNIT: FlatVector::GetData<int8_t>(out.data[i])[n] = static_cast<int8_t>(rec.contract_multiplier_unit); break;
+				case COL_FLOW_SCHEDULE_TYPE: FlatVector::GetData<int8_t>(out.data[i])[n] = static_cast<int8_t>(rec.flow_schedule_type); break;
+				case COL_TICK_RULE:          FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.tick_rule; break;
+				case COL_LEG_COUNT:
+				case COL_LEG_INDEX:
+				case COL_LEG_INSTRUMENT_ID:
+				case COL_LEG_RAW_SYMBOL:
+				case COL_LEG_INSTRUMENT_CLASS:
+				case COL_LEG_SIDE:
+				case COL_LEG_PRICE:
+				case COL_LEG_DELTA:
+				case COL_LEG_RATIO_PRICE_NUMERATOR:
+				case COL_LEG_RATIO_PRICE_DENOMINATOR:
+				case COL_LEG_RATIO_QTY_NUMERATOR:
+				case COL_LEG_RATIO_QTY_DENOMINATOR:
+				case COL_LEG_UNDERLYING_ID:
+					FlatVector::Validity(out.data[i]).SetInvalid(n); break;
+				case COL_TRADING_REFERENCE_PRICE: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.trading_reference_price) * 1e-9; break;
+				case COL_TRADING_REFERENCE_DATE:  FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.trading_reference_date; break;
+				case COL_MD_SECURITY_TRADING_STATUS: FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.md_security_trading_status; break;
+				case COL_SETTL_PRICE_TYPE:        FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.settl_price_type; break;
+				default: break;
+				}
+			}
 			++n;
 		}
 	} else {
 		databento::v1::InstrumentDefMsg rec {};
 		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::InstrumentDef)) {
-			FlatVector::GetData<int64_t>(out.data[0])[n] = static_cast<int64_t>((rec.hd.ts_event).time_since_epoch().count());
-			FlatVector::GetData<int64_t>(out.data[1])[n] = static_cast<int64_t>((rec.ts_recv).time_since_epoch().count());
-			FlatVector::GetData<uint32_t>(out.data[2])[n] = rec.hd.instrument_id;
-			FlatVector::GetData<uint16_t>(out.data[3])[n] = rec.hd.publisher_id;
-			FlatVector::GetData<string_t>(out.data[4])[n] = duckdb_dbn::EmitCstr(out.data[4], rec.RawSymbol(), 64);
-			FlatVector::GetData<string_t>(out.data[5])[n] = duckdb_dbn::EmitChar1(out.data[5], static_cast<char>(rec.instrument_class));
-			FlatVector::GetData<string_t>(out.data[6])[n] = duckdb_dbn::EmitCstr(out.data[6], rec.SecurityType(), 7);
-			FlatVector::GetData<string_t>(out.data[7])[n] = duckdb_dbn::EmitCstr(out.data[7], rec.Exchange(), 5);
-			FlatVector::GetData<string_t>(out.data[8])[n] = duckdb_dbn::EmitCstr(out.data[8], rec.Asset(), 11);
-			FlatVector::GetData<string_t>(out.data[9])[n] = duckdb_dbn::EmitCstr(out.data[9], rec.Cfi(), 7);
-			FlatVector::GetData<string_t>(out.data[10])[n] = duckdb_dbn::EmitCstr(out.data[10], rec.Currency(), 4);
-			FlatVector::GetData<string_t>(out.data[11])[n] = duckdb_dbn::EmitCstr(out.data[11], rec.SettlCurrency(), 4);
-			FlatVector::GetData<string_t>(out.data[12])[n] = duckdb_dbn::EmitCstr(out.data[12], rec.SecSubType(), 6);
-			FlatVector::GetData<string_t>(out.data[13])[n] = duckdb_dbn::EmitCstr(out.data[13], rec.Group(), 21);
-			FlatVector::GetData<string_t>(out.data[14])[n] = duckdb_dbn::EmitCstr(out.data[14], rec.Underlying(), 21);
-			FlatVector::GetData<string_t>(out.data[15])[n] = duckdb_dbn::EmitCstr(out.data[15], rec.StrikePriceCurrency(), 4);
-			FlatVector::GetData<string_t>(out.data[16])[n] = duckdb_dbn::EmitCstr(out.data[16], rec.UnitOfMeasure(), 31);
-			FlatVector::GetData<int64_t>(out.data[17])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count());
-			FlatVector::GetData<int64_t>(out.data[18])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count());
-			FlatVector::GetData<double>(out.data[19])[n] = static_cast<double>(rec.min_price_increment) * 1e-9;
-			FlatVector::GetData<double>(out.data[20])[n] = static_cast<double>(rec.display_factor) * 1e-9;
-			FlatVector::GetData<double>(out.data[21])[n] = static_cast<double>(rec.high_limit_price) * 1e-9;
-			FlatVector::GetData<double>(out.data[22])[n] = static_cast<double>(rec.low_limit_price) * 1e-9;
-			FlatVector::GetData<double>(out.data[23])[n] = static_cast<double>(rec.max_price_variation) * 1e-9;
-			FlatVector::GetData<double>(out.data[24])[n] = static_cast<double>(rec.strike_price) * 1e-9;
-			FlatVector::GetData<double>(out.data[25])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9;
-			FlatVector::GetData<double>(out.data[26])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9;
-			FlatVector::GetData<double>(out.data[27])[n] = static_cast<double>(rec.price_ratio) * 1e-9;
-			FlatVector::GetData<uint64_t>(out.data[28])[n] = static_cast<uint64_t>(rec.raw_instrument_id);
-			FlatVector::GetData<uint32_t>(out.data[29])[n] = rec.underlying_id;
-			FlatVector::GetData<int32_t>(out.data[30])[n] = rec.inst_attrib_value;
-			FlatVector::GetData<int32_t>(out.data[31])[n] = rec.market_depth_implied;
-			FlatVector::GetData<int32_t>(out.data[32])[n] = rec.market_depth;
-			FlatVector::GetData<uint32_t>(out.data[33])[n] = rec.market_segment_id;
-			FlatVector::GetData<uint32_t>(out.data[34])[n] = rec.max_trade_vol;
-			FlatVector::GetData<int32_t>(out.data[35])[n] = rec.min_lot_size;
-			FlatVector::GetData<int32_t>(out.data[36])[n] = rec.min_lot_size_block;
-			FlatVector::GetData<int32_t>(out.data[37])[n] = rec.min_lot_size_round_lot;
-			FlatVector::GetData<uint32_t>(out.data[38])[n] = rec.min_trade_vol;
-			FlatVector::GetData<int32_t>(out.data[39])[n] = rec.contract_multiplier;
-			FlatVector::GetData<int32_t>(out.data[40])[n] = rec.decay_quantity;
-			FlatVector::GetData<int32_t>(out.data[41])[n] = rec.original_contract_size;
-			FlatVector::GetData<int16_t>(out.data[42])[n] = rec.appl_id;
-			FlatVector::GetData<uint16_t>(out.data[43])[n] = rec.maturity_year;
-			FlatVector::GetData<uint16_t>(out.data[44])[n] = rec.decay_start_date;
-			FlatVector::GetData<uint16_t>(out.data[45])[n] = rec.channel_id;
-			FlatVector::GetData<string_t>(out.data[46])[n] = duckdb_dbn::EmitChar1(out.data[46], static_cast<char>(rec.match_algorithm));
-			FlatVector::GetData<uint8_t>(out.data[47])[n] = rec.main_fraction;
-			FlatVector::GetData<uint8_t>(out.data[48])[n] = rec.price_display_format;
-			FlatVector::GetData<uint8_t>(out.data[49])[n] = rec.sub_fraction;
-			FlatVector::GetData<uint8_t>(out.data[50])[n] = rec.underlying_product;
-			FlatVector::GetData<string_t>(out.data[51])[n] = duckdb_dbn::EmitChar1(out.data[51], static_cast<char>(rec.security_update_action));
-			FlatVector::GetData<uint8_t>(out.data[52])[n] = rec.maturity_month;
-			FlatVector::GetData<uint8_t>(out.data[53])[n] = rec.maturity_day;
-			FlatVector::GetData<uint8_t>(out.data[54])[n] = rec.maturity_week;
-			FlatVector::GetData<string_t>(out.data[55])[n] = duckdb_dbn::EmitChar1(out.data[55], static_cast<char>(rec.user_defined_instrument));
-			FlatVector::GetData<int8_t>(out.data[56])[n] = static_cast<int8_t>(rec.contract_multiplier_unit);
-			FlatVector::GetData<int8_t>(out.data[57])[n] = static_cast<int8_t>(rec.flow_schedule_type);
-			FlatVector::GetData<uint8_t>(out.data[58])[n] = rec.tick_rule;
-			FlatVector::Validity(out.data[59]).SetInvalid(n);
-			FlatVector::Validity(out.data[60]).SetInvalid(n);
-			FlatVector::Validity(out.data[61]).SetInvalid(n);
-			FlatVector::Validity(out.data[62]).SetInvalid(n);
-			FlatVector::Validity(out.data[63]).SetInvalid(n);
-			FlatVector::Validity(out.data[64]).SetInvalid(n);
-			FlatVector::Validity(out.data[65]).SetInvalid(n);
-			FlatVector::Validity(out.data[66]).SetInvalid(n);
-			FlatVector::Validity(out.data[67]).SetInvalid(n);
-			FlatVector::Validity(out.data[68]).SetInvalid(n);
-			FlatVector::Validity(out.data[69]).SetInvalid(n);
-			FlatVector::Validity(out.data[70]).SetInvalid(n);
-			FlatVector::Validity(out.data[71]).SetInvalid(n);
-			FlatVector::GetData<double>(out.data[72])[n] = static_cast<double>(rec.trading_reference_price) * 1e-9;
-			FlatVector::GetData<uint16_t>(out.data[73])[n] = rec.trading_reference_date;
-			FlatVector::GetData<uint8_t>(out.data[74])[n] = rec.md_security_trading_status;
-			FlatVector::GetData<uint8_t>(out.data[75])[n] = rec.settl_price_type;
+			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			for (idx_t i = 0; i < projected_count; ++i) {
+				const auto cid = col_ids[i];
+				switch (cid) {
+				case COL_TS_EVENT: FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.hd.ts_event).time_since_epoch().count()); break;
+				case COL_TS_RECV:  FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.ts_recv).time_since_epoch().count()); break;
+				case COL_INSTR:    FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.hd.instrument_id; break;
+				case COL_PUB:      FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.hd.publisher_id; break;
+				case COL_RAW_SYMBOL:         FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.RawSymbol(), 64); break;
+				case COL_INSTRUMENT_CLASS:   FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.instrument_class)); break;
+				case COL_SECURITY_TYPE:      FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.SecurityType(), 7); break;
+				case COL_EXCHANGE:           FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Exchange(), 5); break;
+				case COL_ASSET:              FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Asset(), 11); break;
+				case COL_CFI:                FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Cfi(), 7); break;
+				case COL_CURRENCY:           FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Currency(), 4); break;
+				case COL_SETTL_CURRENCY:     FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.SettlCurrency(), 4); break;
+				case COL_SECSUBTYPE:         FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.SecSubType(), 6); break;
+				case COL_GROUP:              FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Group(), 21); break;
+				case COL_UNDERLYING:         FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.Underlying(), 21); break;
+				case COL_STRIKE_PRICE_CURRENCY: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.StrikePriceCurrency(), 4); break;
+				case COL_UNIT_OF_MEASURE:    FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.UnitOfMeasure(), 31); break;
+				case COL_EXPIRATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count()); break;
+				case COL_ACTIVATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count()); break;
+				case COL_MIN_PRICE_INCREMENT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment) * 1e-9; break;
+				case COL_DISPLAY_FACTOR:     FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.display_factor) * 1e-9; break;
+				case COL_HIGH_LIMIT_PRICE:   FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.high_limit_price) * 1e-9; break;
+				case COL_LOW_LIMIT_PRICE:    FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.low_limit_price) * 1e-9; break;
+				case COL_MAX_PRICE_VARIATION: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.max_price_variation) * 1e-9; break;
+				case COL_STRIKE_PRICE:       FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.strike_price) * 1e-9; break;
+				case COL_UNIT_OF_MEASURE_QTY: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9; break;
+				case COL_MIN_PRICE_INCREMENT_AMOUNT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9; break;
+				case COL_PRICE_RATIO:        FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.price_ratio) * 1e-9; break;
+				case COL_RAW_INSTRUMENT_ID:  FlatVector::GetData<uint64_t>(out.data[i])[n] = static_cast<uint64_t>(rec.raw_instrument_id); break;
+				case COL_UNDERLYING_ID:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.underlying_id; break;
+				case COL_INST_ATTRIB_VALUE:  FlatVector::GetData<int32_t>(out.data[i])[n] = rec.inst_attrib_value; break;
+				case COL_MARKET_DEPTH_IMPLIED: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.market_depth_implied; break;
+				case COL_MARKET_DEPTH:       FlatVector::GetData<int32_t>(out.data[i])[n] = rec.market_depth; break;
+				case COL_MARKET_SEGMENT_ID:  FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.market_segment_id; break;
+				case COL_MAX_TRADE_VOL:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.max_trade_vol; break;
+				case COL_MIN_LOT_SIZE:       FlatVector::GetData<int32_t>(out.data[i])[n] = rec.min_lot_size; break;
+				case COL_MIN_LOT_SIZE_BLOCK: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.min_lot_size_block; break;
+				case COL_MIN_LOT_SIZE_ROUND_LOT: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.min_lot_size_round_lot; break;
+				case COL_MIN_TRADE_VOL:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.min_trade_vol; break;
+				case COL_CONTRACT_MULTIPLIER: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.contract_multiplier; break;
+				case COL_DECAY_QUANTITY:     FlatVector::GetData<int32_t>(out.data[i])[n] = rec.decay_quantity; break;
+				case COL_ORIGINAL_CONTRACT_SIZE: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.original_contract_size; break;
+				case COL_APPL_ID:            FlatVector::GetData<int16_t>(out.data[i])[n] = rec.appl_id; break;
+				case COL_MATURITY_YEAR:      FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.maturity_year; break;
+				case COL_DECAY_START_DATE:   FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.decay_start_date; break;
+				case COL_CHANNEL_ID:         FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.channel_id; break;
+				case COL_MATCH_ALGORITHM:    FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.match_algorithm)); break;
+				case COL_MAIN_FRACTION:      FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.main_fraction; break;
+				case COL_PRICE_DISPLAY_FORMAT: FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.price_display_format; break;
+				case COL_SUB_FRACTION:       FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.sub_fraction; break;
+				case COL_UNDERLYING_PRODUCT: FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.underlying_product; break;
+				case COL_SECURITY_UPDATE_ACTION: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.security_update_action)); break;
+				case COL_MATURITY_MONTH:     FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.maturity_month; break;
+				case COL_MATURITY_DAY:       FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.maturity_day; break;
+				case COL_MATURITY_WEEK:      FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.maturity_week; break;
+				case COL_USER_DEFINED_INSTRUMENT: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.user_defined_instrument)); break;
+				case COL_CONTRACT_MULTIPLIER_UNIT: FlatVector::GetData<int8_t>(out.data[i])[n] = static_cast<int8_t>(rec.contract_multiplier_unit); break;
+				case COL_FLOW_SCHEDULE_TYPE: FlatVector::GetData<int8_t>(out.data[i])[n] = static_cast<int8_t>(rec.flow_schedule_type); break;
+				case COL_TICK_RULE:          FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.tick_rule; break;
+				case COL_LEG_COUNT:
+				case COL_LEG_INDEX:
+				case COL_LEG_INSTRUMENT_ID:
+				case COL_LEG_RAW_SYMBOL:
+				case COL_LEG_INSTRUMENT_CLASS:
+				case COL_LEG_SIDE:
+				case COL_LEG_PRICE:
+				case COL_LEG_DELTA:
+				case COL_LEG_RATIO_PRICE_NUMERATOR:
+				case COL_LEG_RATIO_PRICE_DENOMINATOR:
+				case COL_LEG_RATIO_QTY_NUMERATOR:
+				case COL_LEG_RATIO_QTY_DENOMINATOR:
+				case COL_LEG_UNDERLYING_ID:
+					FlatVector::Validity(out.data[i]).SetInvalid(n); break;
+				case COL_TRADING_REFERENCE_PRICE: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.trading_reference_price) * 1e-9; break;
+				case COL_TRADING_REFERENCE_DATE:  FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.trading_reference_date; break;
+				case COL_MD_SECURITY_TRADING_STATUS: FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.md_security_trading_status; break;
+				case COL_SETTL_PRICE_TYPE:        FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.settl_price_type; break;
+				default: break;
+				}
+			}
 			++n;
 		}
 	}
@@ -1343,6 +2158,21 @@ static unique_ptr<FunctionData> ReadDbnBind(ClientContext &context, TableFunctio
 	(void)handler->bind(context, input, return_types, names);
 	auto bd = make_uniq<ReadDbnBindDataPolymorphic>();
 	bd->file_paths = std::move(paths);
+	switch (*md.schema) {
+	case databento::Schema::Ohlcv1S:
+	case databento::Schema::Ohlcv1M:
+	case databento::Schema::Ohlcv1H:
+	case databento::Schema::Ohlcv1D:
+	case databento::Schema::OhlcvEod:
+		bd->header_layout = kHeaderLayoutOhlcv;
+		break;
+	case databento::Schema::Statistics:
+		bd->header_layout = DbnHeaderColumnLayout{0, 3, 4};
+		break;
+	default:
+		bd->header_layout = kHeaderLayoutStandard;
+		break;
+	}
 	bd->dispatched_scan = handler->scan;
 	return std::move(bd);
 }
@@ -1431,9 +2261,15 @@ struct DbnRecordsBindData : public TableFunctionData {
 };
 
 struct DbnRecordsGlobalState : public GlobalTableFunctionState {
-	explicit DbnRecordsGlobalState(const std::string &path)
-	    : reader(std::make_unique<duckdb_dbn::DbnFileReader>(path)) {}
+	DbnRecordsGlobalState(const std::string &path,
+	                      std::vector<column_t> column_ids_p,
+	                      DbnHeaderFilter header_filter_p)
+	    : reader(std::make_unique<duckdb_dbn::DbnFileReader>(path)),
+	      column_ids(std::move(column_ids_p)),
+	      header_filter(std::move(header_filter_p)) {}
 	std::unique_ptr<duckdb_dbn::DbnFileReader> reader;
+	std::vector<column_t> column_ids;
+	DbnHeaderFilter header_filter;
 };
 
 static unique_ptr<FunctionData> DbnRecordsBind(ClientContext &, TableFunctionBindInput &input,
@@ -1448,29 +2284,65 @@ static unique_ptr<FunctionData> DbnRecordsBind(ClientContext &, TableFunctionBin
 
 static unique_ptr<GlobalTableFunctionState> DbnRecordsInitGlobal(ClientContext &, TableFunctionInitInput &input) {
 	auto &bd = input.bind_data->Cast<DbnRecordsBindData>();
-	return make_uniq<DbnRecordsGlobalState>(bd.file_path);
+	auto hf = BuildHeaderFilter(input.filters, kHeaderLayoutRecords);
+	std::vector<column_t> col_ids = input.column_ids;
+	return make_uniq<DbnRecordsGlobalState>(bd.file_path, std::move(col_ids), std::move(hf));
 }
 
 static void DbnRecordsScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
 	auto &st = input.global_state->Cast<DbnRecordsGlobalState>();
-	auto ts_event_v = FlatVector::GetData<int64_t>(out.data[0]);
-	auto rtype_v = FlatVector::GetData<uint8_t>(out.data[1]);
-	auto length_v = FlatVector::GetData<uint8_t>(out.data[2]);
-	auto pub_v = FlatVector::GetData<uint16_t>(out.data[3]);
-	auto instr_v = FlatVector::GetData<uint32_t>(out.data[4]);
-	auto body_v = FlatVector::GetData<string_t>(out.data[5]);
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0,
+		COL_RTYPE    = 1,
+		COL_LENGTH   = 2,
+		COL_PUB      = 3,
+		COL_INSTR    = 4,
+		COL_BODY     = 5,
+	};
+
+	std::array<int64_t *,  8> p_i64 {};
+	std::array<uint8_t *,  8> p_u8  {};
+	std::array<uint16_t *, 8> p_u16 {};
+	std::array<uint32_t *, 8> p_u32 {};
+	std::array<string_t *, 8> p_str {};
+	D_ASSERT(projected_count <= 8);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT: p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_RTYPE:    p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_LENGTH:   p_u8[i]  = FlatVector::GetData<uint8_t>(out.data[i]); break;
+		case COL_PUB:      p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_INSTR:    p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_BODY:     p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		default: break;
+		}
+	}
 
 	alignas(8) std::byte buf[duckdb_dbn::DbnFileReader::kMaxRecordLen];
 	databento::RecordHeader hdr {};
 	std::size_t rec_len = 0;
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextRecordRaw(buf, &hdr, &rec_len, nullptr)) {
-		ts_event_v[n] = static_cast<int64_t>(hdr.ts_event.time_since_epoch().count());
-		rtype_v[n] = static_cast<uint8_t>(hdr.rtype);
-		length_v[n] = hdr.length;
-		pub_v[n] = hdr.publisher_id;
-		instr_v[n] = hdr.instrument_id;
-		body_v[n] = StringVector::AddStringOrBlob(out.data[5], reinterpret_cast<const char *>(buf), rec_len);
+		if (!st.header_filter.Matches(hdr)) { continue; }
+		for (idx_t i = 0; i < projected_count; ++i) {
+			const auto cid = col_ids[i];
+			switch (cid) {
+			case COL_TS_EVENT: p_i64[i][n] = static_cast<int64_t>(hdr.ts_event.time_since_epoch().count()); break;
+			case COL_RTYPE:    p_u8[i][n]  = static_cast<uint8_t>(hdr.rtype); break;
+			case COL_LENGTH:   p_u8[i][n]  = hdr.length; break;
+			case COL_PUB:      p_u16[i][n] = hdr.publisher_id; break;
+			case COL_INSTR:    p_u32[i][n] = hdr.instrument_id; break;
+			case COL_BODY:     p_str[i][n] = StringVector::AddStringOrBlob(out.data[i], reinterpret_cast<const char *>(buf), rec_len); break;
+			default: break;
+			}
+		}
 		++n;
 	}
 	out.SetCardinality(n);
@@ -1501,8 +2373,11 @@ static unique_ptr<TableRef> ReadDbnReplacement(ClientContext &, ReplacementScanI
 // Registration
 // ════════════════════════════════════════════════════════════════════════════
 
-static void Register(ExtensionLoader &loader, const char *name, table_function_bind_t bind, table_function_t scan) {
+static void Register(ExtensionLoader &loader, const char *name,
+                     table_function_bind_t bind, table_function_t scan) {
 	TableFunction f(name, {LogicalType::VARCHAR}, scan, bind, ReadDbnInitGlobal);
+	f.projection_pushdown = true;
+	f.filter_pushdown = true;
 	loader.RegisterFunction(f);
 }
 
@@ -1533,6 +2408,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(mf);
 
 	TableFunction rf("dbn_records", {LogicalType::VARCHAR}, DbnRecordsScan, DbnRecordsBind, DbnRecordsInitGlobal);
+	rf.projection_pushdown = true;
+	rf.filter_pushdown = true;
 	loader.RegisterFunction(rf);
 
 	DBConfig::GetConfig(loader.GetDatabaseInstance()).replacement_scans.emplace_back(ReadDbnReplacement);
