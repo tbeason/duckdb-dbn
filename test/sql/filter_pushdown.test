@@ -87,10 +87,13 @@ WHERE instrument_id = 5482 AND epoch_ns(ts_event) > 1609160400100000000
 
 # ──────────────────────────────────────────────────────────────────────────
 # Body-column filters — regression coverage for the silent-drop bug
-# (filter_pushdown=true used to claim we'd apply ALL filters, but our
+# (Phase 5-B's filter_pushdown=true claimed we'd apply ALL filters, but
 # DbnHeaderFilter only handles ts_event/instrument_id/publisher_id. Body
 # filters like price/size/side/action were silently dropped, returning
-# the whole table. Now filter_pushdown=false, so DuckDB applies them.)
+# the whole table — fixed temporarily by setting filter_pushdown=false in
+# 307ff92, then properly in Phase 5-E by adding ApplyBodyFilters: the
+# scan now pre-screens with the header filter (early skip during decode)
+# AND post-filters with ExpressionExecutor for body columns.)
 # ──────────────────────────────────────────────────────────────────────────
 
 # size: trades fixture has rows with size=5 and size=21. Filtering for

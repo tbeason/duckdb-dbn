@@ -11,6 +11,9 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -331,12 +334,78 @@ static DbnHeaderFilter BuildHeaderFilter(optional_ptr<TableFilterSet> filters,
 		} else if (col == layout.publisher_id_col) {
 			IngestFilter(HeaderColumn::PublisherId, flt, hf);
 		}
-		// Other columns — body predicates — are silently ignored here. DuckDB
-		// re-evaluates them above the scan.
+		// Other columns — body predicates — are handled separately by
+		// ApplyBodyFilters after the scan emits a chunk (see Phase 5-E).
+		// Skipping them here keeps the header pre-screen branch-light.
 	}
 	hf.any_active = hf.ts_event_active || hf.instr_range_active || !hf.instr_in.empty() ||
 	                hf.pub_range_active || !hf.pub_in.empty();
 	return hf;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Body-column filter evaluator
+//
+// DbnHeaderFilter pre-screens records by ts_event / instrument_id /
+// publisher_id during the scan loop (cheap, per-record) — but DuckDB pushes
+// ALL WHEREs to us when filter_pushdown=true, including ones on body
+// columns (price, size, side, bid_price, bid_size, ...). After the scan
+// populates the output chunk with records that survived the header
+// pre-screen, ApplyBodyFilters evaluates every non-header TableFilter
+// against the chunk via ExpressionExecutor and slices to keep only the
+// rows that satisfy all remaining predicates.
+//
+// Without this, body-column WHEREs are silently dropped — the very bug
+// that motivated the temporary filter_pushdown=false from commit 307ff92.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void ApplyBodyFilters(ClientContext &context,
+                             optional_ptr<TableFilterSet> filters,
+                             const std::vector<column_t> &column_ids,
+                             const DbnHeaderColumnLayout &layout,
+                             DataChunk &chunk) {
+	if (!filters || chunk.size() == 0) {
+		return;
+	}
+	// Collect filters on body columns (header filters are already applied
+	// per-record inside the scan loop via DbnHeaderFilter::Matches).
+	vector<unique_ptr<Expression>> filter_exprs;
+	for (auto &entry : filters->filters) {
+		const auto pidx = entry.first;
+		if (pidx >= column_ids.size()) {
+			continue;
+		}
+		const auto col = column_ids[pidx];
+		if (col == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		if (col == layout.ts_event_col || col == layout.instrument_id_col ||
+		    col == layout.publisher_id_col) {
+			continue;  // header pre-screen already handled this
+		}
+		auto col_ref = make_uniq<BoundReferenceExpression>(chunk.data[pidx].GetType(), pidx);
+		filter_exprs.push_back(entry.second->ToExpression(*col_ref));
+	}
+	if (filter_exprs.empty()) {
+		return;
+	}
+	// AND together if multiple.
+	unique_ptr<Expression> root;
+	if (filter_exprs.size() == 1) {
+		root = std::move(filter_exprs[0]);
+	} else {
+		auto conj = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+		for (auto &e : filter_exprs) {
+			conj->children.push_back(std::move(e));
+		}
+		root = std::move(conj);
+	}
+	ExpressionExecutor executor(context, *root);
+	SelectionVector sel(STANDARD_VECTOR_SIZE);
+	const idx_t pass = executor.SelectExpression(chunk, sel);
+	if (pass < chunk.size()) {
+		chunk.Slice(sel, pass);
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -354,10 +423,12 @@ struct ReadDbnBindData : public TableFunctionData {
 struct ReadDbnGlobalState : public GlobalTableFunctionState {
 	ReadDbnGlobalState(std::vector<std::string> paths,
 	                   std::vector<column_t> column_ids_p,
-	                   DbnHeaderFilter header_filter_p)
+	                   DbnHeaderFilter header_filter_p,
+	                   unique_ptr<TableFilterSet> filters_p)
 	    : reader(std::make_unique<duckdb_dbn::DbnFileReader>(std::move(paths))),
 	      column_ids(std::move(column_ids_p)),
-	      header_filter(std::move(header_filter_p)) {}
+	      header_filter(std::move(header_filter_p)),
+	      filters(std::move(filters_p)) {}
 	std::unique_ptr<duckdb_dbn::DbnFileReader> reader;
 	// Logical column ids the optimizer asked for, in projection order.
 	// out.data[i] corresponds to column_ids[i]. May contain
@@ -365,6 +436,10 @@ struct ReadDbnGlobalState : public GlobalTableFunctionState {
 	// as "skip, no output to fill for this slot" since we never emit row ids.
 	std::vector<column_t> column_ids;
 	DbnHeaderFilter header_filter;
+	// Deep copy of the pushed-down filter set, stashed at init so scan-time
+	// ApplyBodyFilters can reach it. TableFunctionInput (scan) doesn't
+	// expose filters — only TableFunctionInitInput does.
+	unique_ptr<TableFilterSet> filters;
 };
 
 static unique_ptr<GlobalTableFunctionState>
@@ -372,7 +447,9 @@ ReadDbnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
 	auto &bd = input.bind_data->Cast<ReadDbnBindData>();
 	std::vector<column_t> col_ids = input.column_ids;
 	auto hf = BuildHeaderFilter(input.filters, col_ids, bd.header_layout);
-	return make_uniq<ReadDbnGlobalState>(bd.file_paths, std::move(col_ids), std::move(hf));
+	auto filters_copy = input.filters ? input.filters->Copy() : nullptr;
+	return make_uniq<ReadDbnGlobalState>(bd.file_paths, std::move(col_ids),
+	                                     std::move(hf), std::move(filters_copy));
 }
 
 
@@ -483,8 +560,8 @@ static void TradesScan(ClientContext &, TableFunctionInput &input, DataChunk &ou
 	databento::TradeMsg rec {};
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Mbp0)) {
-		// Header pre-screen. Body-field predicates are NOT honored here —
-		// DuckDB re-evaluates them above us.
+		// Header pre-screen (early skip during decode). Body-field predicates
+		// are evaluated by ApplyBodyFilters after the chunk is populated.
 		if (!st.header_filter.Matches(rec.hd)) {
 			continue;
 		}
@@ -2280,6 +2357,8 @@ struct DbnRecordsGlobalState : public GlobalTableFunctionState {
 	std::unique_ptr<duckdb_dbn::DbnFileReader> reader;
 	std::vector<column_t> column_ids;
 	DbnHeaderFilter header_filter;
+	// Deep copy of pushed-down filter set (see ReadDbnGlobalState).
+	unique_ptr<TableFilterSet> filters;
 };
 
 static unique_ptr<FunctionData> DbnRecordsBind(ClientContext &, TableFunctionBindInput &input,
@@ -2296,7 +2375,11 @@ static unique_ptr<GlobalTableFunctionState> DbnRecordsInitGlobal(ClientContext &
 	auto &bd = input.bind_data->Cast<DbnRecordsBindData>();
 	std::vector<column_t> col_ids = input.column_ids;
 	auto hf = BuildHeaderFilter(input.filters, col_ids, kHeaderLayoutRecords);
-	return make_uniq<DbnRecordsGlobalState>(bd.file_path, std::move(col_ids), std::move(hf));
+	auto state = make_uniq<DbnRecordsGlobalState>(bd.file_path, std::move(col_ids), std::move(hf));
+	if (input.filters) {
+		state->filters = input.filters->Copy();
+	}
+	return std::move(state);
 }
 
 static void DbnRecordsScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
@@ -2383,51 +2466,78 @@ static unique_ptr<TableRef> ReadDbnReplacement(ClientContext &, ReplacementScanI
 // Registration
 // ════════════════════════════════════════════════════════════════════════════
 
+// Wraps an inner per-schema scan with the body-column filter pass. The inner
+// scan emits records that survive DbnHeaderFilter's ts_event/instrument_id/
+// publisher_id pre-screen during decode; this wrapper then evaluates every
+// remaining (body-column) TableFilter against the chunk via
+// ExpressionExecutor. With this in place, filter_pushdown=true is safe —
+// header filters get the per-record early-skip fast path and body filters
+// still take effect (no silent drop).
+template <table_function_t Inner>
+static void ScanWithBodyFilter(ClientContext &c, TableFunctionInput &input, DataChunk &out) {
+	Inner(c, input, out);
+	if (out.size() == 0) {
+		return;
+	}
+	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
+	if (!st.filters) {
+		return;
+	}
+	auto &bd = input.bind_data->Cast<ReadDbnBindData>();
+	ApplyBodyFilters(c, st.filters.get(), st.column_ids, bd.header_layout, out);
+}
+
+template <table_function_t Inner>
 static void Register(ExtensionLoader &loader, const char *name,
-                     table_function_bind_t bind, table_function_t scan) {
-	TableFunction f(name, {LogicalType::VARCHAR}, scan, bind, ReadDbnInitGlobal);
+                     table_function_bind_t bind) {
+	TableFunction f(name, {LogicalType::VARCHAR}, ScanWithBodyFilter<Inner>, bind, ReadDbnInitGlobal);
 	f.projection_pushdown = true;
-	// filter_pushdown intentionally false: when true, DuckDB removes WHERE
-	// from the post-scan plan and trusts the table function to apply ALL
-	// filters. Our scan only applies header-column filters (ts_event,
-	// instrument_id, publisher_id) via DbnHeaderFilter — body-column filters
-	// (price, size, bid_price, action, etc.) would be silently dropped,
-	// returning the whole table. Until we evaluate body filters in-scan
-	// (tracked as Phase 5-E), let DuckDB apply every filter above the scan.
-	// BuildHeaderFilter still exists as scaffolding for that future fast path.
-	f.filter_pushdown = false;
+	f.filter_pushdown = true;
 	loader.RegisterFunction(f);
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	Register(loader, "read_dbn", ReadDbnBind, ReadDbnScan);
-	Register(loader, "read_dbn_trades", TradesBind, TradesScan);
-	Register(loader, "read_dbn_mbo", MboBind, MboScan);
-	Register(loader, "read_dbn_mbp1", Mbp1Bind, Mbp1Scan);
-	Register(loader, "read_dbn_mbp10", Mbp10Bind, Mbp10Scan);
-	Register(loader, "read_dbn_bbo_1s", BboBind, Bbo1sScan);
-	Register(loader, "read_dbn_bbo_1m", BboBind, Bbo1mScan);
-	Register(loader, "read_dbn_cbbo_1s", CbboBind, Cbbo1sScan);
-	Register(loader, "read_dbn_cmbp1", Cmbp1Bind, Cmbp1Scan);
-	Register(loader, "read_dbn_tbbo", TbboBind, TbboScan);
-	Register(loader, "read_dbn_ohlcv_1s", OhlcvBind, Ohlcv1sScan);
-	Register(loader, "read_dbn_ohlcv_1m", OhlcvBind, Ohlcv1mScan);
-	Register(loader, "read_dbn_ohlcv_1h", OhlcvBind, Ohlcv1hScan);
-	Register(loader, "read_dbn_ohlcv_1d", OhlcvBind, Ohlcv1dScan);
-	Register(loader, "read_dbn_status", StatusBind, StatusScan);
-	Register(loader, "read_dbn_imbalance", ImbalanceBind, ImbalanceScan);
-	Register(loader, "read_dbn_statistics", StatisticsBind, StatisticsScan);
-	Register(loader, "read_dbn_definition", DefinitionBind, DefinitionScan);
-	Register(loader, "read_dbn_cbbo_1m", CbboBind, Cbbo1mScan);
-	Register(loader, "read_dbn_ohlcv_eod", OhlcvBind, OhlcvEodScan);
-	Register(loader, "read_dbn_tcbbo", Cmbp1Bind, TcbboScan);
+	Register<ReadDbnScan>(loader, "read_dbn", ReadDbnBind);
+	Register<TradesScan>(loader, "read_dbn_trades", TradesBind);
+	Register<MboScan>(loader, "read_dbn_mbo", MboBind);
+	Register<Mbp1Scan>(loader, "read_dbn_mbp1", Mbp1Bind);
+	Register<Mbp10Scan>(loader, "read_dbn_mbp10", Mbp10Bind);
+	Register<Bbo1sScan>(loader, "read_dbn_bbo_1s", BboBind);
+	Register<Bbo1mScan>(loader, "read_dbn_bbo_1m", BboBind);
+	Register<Cbbo1sScan>(loader, "read_dbn_cbbo_1s", CbboBind);
+	Register<Cmbp1Scan>(loader, "read_dbn_cmbp1", Cmbp1Bind);
+	Register<TbboScan>(loader, "read_dbn_tbbo", TbboBind);
+	Register<Ohlcv1sScan>(loader, "read_dbn_ohlcv_1s", OhlcvBind);
+	Register<Ohlcv1mScan>(loader, "read_dbn_ohlcv_1m", OhlcvBind);
+	Register<Ohlcv1hScan>(loader, "read_dbn_ohlcv_1h", OhlcvBind);
+	Register<Ohlcv1dScan>(loader, "read_dbn_ohlcv_1d", OhlcvBind);
+	Register<StatusScan>(loader, "read_dbn_status", StatusBind);
+	Register<ImbalanceScan>(loader, "read_dbn_imbalance", ImbalanceBind);
+	Register<StatisticsScan>(loader, "read_dbn_statistics", StatisticsBind);
+	Register<DefinitionScan>(loader, "read_dbn_definition", DefinitionBind);
+	Register<Cbbo1mScan>(loader, "read_dbn_cbbo_1m", CbboBind);
+	Register<OhlcvEodScan>(loader, "read_dbn_ohlcv_eod", OhlcvBind);
+	Register<TcbboScan>(loader, "read_dbn_tcbbo", Cmbp1Bind);
 
 	TableFunction mf("dbn_metadata", {LogicalType::VARCHAR}, DbnMetadataScan, DbnMetadataBind, DbnMetadataInitGlobal);
 	loader.RegisterFunction(mf);
 
-	TableFunction rf("dbn_records", {LogicalType::VARCHAR}, DbnRecordsScan, DbnRecordsBind, DbnRecordsInitGlobal);
+	// dbn_records uses its own bind/global state and a hardcoded Records layout
+	// {ts_event=0, instrument=4, publisher=3}, so it gets its own wrapper.
+	auto records_scan = +[](ClientContext &c, TableFunctionInput &input, DataChunk &out) {
+		DbnRecordsScan(c, input, out);
+		if (out.size() == 0) {
+			return;
+		}
+		auto &st = input.global_state->Cast<DbnRecordsGlobalState>();
+		if (!st.filters) {
+			return;
+		}
+		ApplyBodyFilters(c, st.filters.get(), st.column_ids, kHeaderLayoutRecords, out);
+	};
+	TableFunction rf("dbn_records", {LogicalType::VARCHAR}, records_scan, DbnRecordsBind, DbnRecordsInitGlobal);
 	rf.projection_pushdown = true;
-	rf.filter_pushdown = false;  // see comment in Register() above
+	rf.filter_pushdown = true;
 	loader.RegisterFunction(rf);
 
 	DBConfig::GetConfig(loader.GetDatabaseInstance()).replacement_scans.emplace_back(ReadDbnReplacement);
