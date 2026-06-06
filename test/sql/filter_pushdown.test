@@ -86,6 +86,114 @@ WHERE instrument_id = 5482 AND epoch_ns(ts_event) > 1609160400100000000
 3720.25
 
 # ──────────────────────────────────────────────────────────────────────────
+# Body-column filters — regression coverage for the silent-drop bug
+# (filter_pushdown=true used to claim we'd apply ALL filters, but our
+# DbnHeaderFilter only handles ts_event/instrument_id/publisher_id. Body
+# filters like price/size/side/action were silently dropped, returning
+# the whole table. Now filter_pushdown=false, so DuckDB applies them.)
+# ──────────────────────────────────────────────────────────────────────────
+
+# size: trades fixture has rows with size=5 and size=21. Filtering for
+# size=21 must return exactly the one row, not all rows.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE size = 21
+----
+1
+
+# size: predicate matches nothing → 0 rows (not 2).
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE size = 999999
+----
+0
+
+# side: char-enum body column. Trades fixture has side='A' for both rows;
+# filter for the non-matching side must yield 0.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE side = 'B'
+----
+0
+
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE side = 'A'
+----
+2
+
+# price (DOUBLE body column): both rows have price=3720.25.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE price = 3720.25
+----
+2
+
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE price > 9999.0
+----
+0
+
+# Body-column filter on mbp-1 (uses BBO-style naming `bid_price`, not
+# `bid_px_00` — the CSV uses _00 but the extension uses bid_price): both
+# fixture rows have bid_price=3720.25.
+query I
+SELECT count(*) FROM read_dbn_mbp1('test/data/test_data.mbp-1.dbn')
+WHERE bid_price = 3720.25
+----
+2
+
+query I
+SELECT count(*) FROM read_dbn_mbp1('test/data/test_data.mbp-1.dbn')
+WHERE bid_price > 9999.0
+----
+0
+
+# Body-column filter on mbp-10 (uses MBP-style _NN naming): exercise the
+# level-suffix path that BBO/CMBP schemas don't.
+query I
+SELECT count(*) FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn')
+WHERE bid_px_00 = 3720.25
+----
+2
+
+query I
+SELECT count(*) FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn')
+WHERE bid_px_00 > 9999.0
+----
+0
+
+# Body-column filter on the tcbbo schema using the new fixture — the
+# bid_size body column. Fixture rows have bid_size=26 (constant); a
+# > predicate must filter accordingly. This is the exact shape that
+# surfaced the original bug ("WHERE bid_size > 200 returns all rows").
+query I
+SELECT count(*) FROM read_dbn_tcbbo('test/data/test_data.tcbbo.dbn')
+WHERE bid_size > 200
+----
+0
+
+query I
+SELECT count(*) FROM read_dbn_tcbbo('test/data/test_data.tcbbo.dbn')
+WHERE bid_size = 26
+----
+4
+
+# Mixed header + body filter — both must apply.
+query I
+SELECT count(*) FROM read_dbn_tcbbo('test/data/test_data.tcbbo.dbn')
+WHERE instrument_id IN (5482, 6002) AND bid_size = 26
+----
+2
+
+query I
+SELECT count(*) FROM read_dbn_tcbbo('test/data/test_data.tcbbo.dbn')
+WHERE instrument_id IN (5482, 6002) AND bid_size > 200
+----
+0
+
+# ──────────────────────────────────────────────────────────────────────────
 # ohlcv-1s — Ohlcv layout, no ts_recv. Verifies kHeaderLayoutOhlcv is wired
 # correctly through the filter path.
 # ──────────────────────────────────────────────────────────────────────────

@@ -2387,7 +2387,15 @@ static void Register(ExtensionLoader &loader, const char *name,
                      table_function_bind_t bind, table_function_t scan) {
 	TableFunction f(name, {LogicalType::VARCHAR}, scan, bind, ReadDbnInitGlobal);
 	f.projection_pushdown = true;
-	f.filter_pushdown = true;
+	// filter_pushdown intentionally false: when true, DuckDB removes WHERE
+	// from the post-scan plan and trusts the table function to apply ALL
+	// filters. Our scan only applies header-column filters (ts_event,
+	// instrument_id, publisher_id) via DbnHeaderFilter — body-column filters
+	// (price, size, bid_price, action, etc.) would be silently dropped,
+	// returning the whole table. Until we evaluate body filters in-scan
+	// (tracked as Phase 5-E), let DuckDB apply every filter above the scan.
+	// BuildHeaderFilter still exists as scaffolding for that future fast path.
+	f.filter_pushdown = false;
 	loader.RegisterFunction(f);
 }
 
@@ -2419,7 +2427,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	TableFunction rf("dbn_records", {LogicalType::VARCHAR}, DbnRecordsScan, DbnRecordsBind, DbnRecordsInitGlobal);
 	rf.projection_pushdown = true;
-	rf.filter_pushdown = true;
+	rf.filter_pushdown = false;  // see comment in Register() above
 	loader.RegisterFunction(rf);
 
 	DBConfig::GetConfig(loader.GetDatabaseInstance()).replacement_scans.emplace_back(ReadDbnReplacement);
