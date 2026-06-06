@@ -132,6 +132,29 @@ SCHEMAS: dict[str, dict] = {
         "column_renames": BBO_RENAMES,
         "price_columns": ["price", "bid_price", "ask_price"],
     },
+    "cbbo-1m": {
+        # Same shape as cbbo-1s (CbboBind).
+        "ext_columns": [
+            "ts_event", "ts_recv", "instrument_id", "publisher_id",
+            "price", "size", "side", "flags",
+            "bid_price", "ask_price", "bid_size", "ask_size",
+            "bid_pb", "ask_pb",
+        ],
+        "column_renames": BBO_RENAMES,
+        "price_columns": ["price", "bid_price", "ask_price"],
+    },
+    "tcbbo": {
+        # Cmbp1Bind: 16 cols with bid_price/ask_price naming, no sequence.
+        "ext_columns": [
+            "ts_event", "ts_recv", "instrument_id", "publisher_id",
+            "price", "size", "action", "side",
+            "flags", "ts_in_delta",
+            "bid_price", "ask_price", "bid_size", "ask_size",
+            "bid_pb", "ask_pb",
+        ],
+        "column_renames": BBO_RENAMES,
+        "price_columns": ["price", "bid_price", "ask_price"],
+    },
     "cmbp-1": {
         # 16 cols; no sequence.
         "ext_columns": [
@@ -163,6 +186,21 @@ SCHEMAS: dict[str, dict] = {
         "ext_columns": ["ts_event", "instrument_id", "publisher_id",
                         "open", "high", "low", "close", "volume"],
         "price_columns": ["open", "high", "low", "close"],
+    },
+    "ohlcv-eod": {
+        # Same shape as the other OHLCV variants (OhlcvBind).
+        "ext_columns": ["ts_event", "instrument_id", "publisher_id",
+                        "open", "high", "low", "close", "volume"],
+        "price_columns": ["open", "high", "low", "close"],
+    },
+    "trades.empty": {
+        # Wire-identical to trades; zero rows.
+        "ext_columns": [
+            "ts_event", "ts_recv", "instrument_id", "publisher_id",
+            "price", "size", "action", "side",
+            "flags", "depth", "ts_in_delta", "sequence",
+        ],
+        "price_columns": ["price"],
     },
     "status": {
         "ext_columns": None,  # discovery pass
@@ -249,14 +287,17 @@ def transform(raw_csv: str, schema: str, version: str) -> str:
 
 
 def parse_schema_from_name(name: str) -> str | None:
-    """`test_data.trades.dbn` → `trades`; `test_data.mbp-1.v2.dbn.zst` → `mbp-1`.
+    """`test_data.trades.dbn` → `trades`; `test_data.mbp-1.v2.dbn.zst` → `mbp-1`;
+    `test_data.trades.empty.dbn` → `trades.empty`.
 
     Returns None for files that don't follow the naming convention.
     """
-    m = re.match(r"test_data\.([^.]+(?:\.v\d+)?)\.dbn(?:\.zst)?$", name)
+    # Strip prefix + .dbn/.dbn.zst suffix; what's left is the schema slug
+    # (optionally with a `.vN` version qualifier appended).
+    m = re.match(r"test_data\.(.+?)(?:\.v\d+)?\.dbn(?:\.zst)?$", name)
     if not m:
         return None
-    return m.group(1).split(".v")[0]
+    return m.group(1)
 
 
 def main() -> int:
