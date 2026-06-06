@@ -301,13 +301,28 @@ static constexpr DbnHeaderColumnLayout kHeaderLayoutOhlcv    {0, 1, 2};
 static constexpr DbnHeaderColumnLayout kHeaderLayoutRecords  {0, 4, 3};
 
 static DbnHeaderFilter BuildHeaderFilter(optional_ptr<TableFilterSet> filters,
+                                         const std::vector<column_t> &column_ids,
                                          const DbnHeaderColumnLayout &layout) {
 	DbnHeaderFilter hf;
 	if (!filters) {
 		return hf;
 	}
+	// When projection_pushdown=true, TableFilterSet keys are indices into
+	// column_ids (projected-space), NOT raw logical column ids. We translate
+	// through column_ids to recover the original column id before matching
+	// against the layout. Without this, a filter on instrument_id (col 2)
+	// shows up as filter on projection slot 0 (because column_ids=[2]) and
+	// got silently routed to whichever HeaderColumn matched logical-id 0
+	// — usually ts_event — producing nonsense ranges that rejected every row.
 	for (auto &entry : filters->filters) {
-		const auto col = static_cast<column_t>(entry.first);
+		const auto pidx = entry.first;
+		if (pidx >= column_ids.size()) {
+			continue;
+		}
+		const auto col = column_ids[pidx];
+		if (col == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
 		const auto &flt = *entry.second;
 		if (col == layout.ts_event_col) {
 			IngestFilter(HeaderColumn::TsEvent, flt, hf);
@@ -355,13 +370,8 @@ struct ReadDbnGlobalState : public GlobalTableFunctionState {
 static unique_ptr<GlobalTableFunctionState>
 ReadDbnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
 	auto &bd = input.bind_data->Cast<ReadDbnBindData>();
-	auto hf = BuildHeaderFilter(input.filters, bd.header_layout);
-	// input.column_ids is empty iff the optimizer wants every bound column
-	// (happens when projection_pushdown is on but the query selects *). In
-	// that case scans below see an empty col_ids and must fall back to the
-	// declared schema order — but with projection_pushdown=true DuckDB
-	// always populates column_ids, so this is fine.
 	std::vector<column_t> col_ids = input.column_ids;
+	auto hf = BuildHeaderFilter(input.filters, col_ids, bd.header_layout);
 	return make_uniq<ReadDbnGlobalState>(bd.file_paths, std::move(col_ids), std::move(hf));
 }
 
@@ -494,7 +504,7 @@ static void TradesScan(ClientContext &, TableFunctionInput &input, DataChunk &ou
 				p_u16[i][n] = rec.hd.publisher_id;
 				break;
 			case COL_PRICE:
-				p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9;
+				p_dbl[i][n] = static_cast<double>(rec.price) / 1e9;
 				break;
 			case COL_SIZE:
 				p_u32[i][n] = rec.size;
@@ -604,7 +614,7 @@ static void MboScan(ClientContext &, TableFunctionInput &input, DataChunk &out) 
 			case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
 			case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
 			case COL_ORDER_ID: p_u64[i][n] = rec.order_id; break;
-			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) / 1e9; break;
 			case COL_SIZE:     p_u32[i][n] = rec.size; break;
 			case COL_FLAGS:    p_u8[i][n]  = rec.flags.Raw(); break;
 			case COL_CHANNEL:  p_u8[i][n]  = rec.channel_id; break;
@@ -698,8 +708,8 @@ static void Mbp1ScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &
 			case COL_TS_RECV:   p_i64[i][n] = TsToInt64(rec.ts_recv); break;
 			case COL_INSTR:     p_u32[i][n] = rec.hd.instrument_id; break;
 			case COL_PUB:       p_u16[i][n] = rec.hd.publisher_id; break;
-			case COL_BID_PRICE: p_dbl[i][n] = static_cast<double>(L.bid_px) * 1e-9; break;
-			case COL_ASK_PRICE: p_dbl[i][n] = static_cast<double>(L.ask_px) * 1e-9; break;
+			case COL_BID_PRICE: p_dbl[i][n] = static_cast<double>(L.bid_px) / 1e9; break;
+			case COL_ASK_PRICE: p_dbl[i][n] = static_cast<double>(L.ask_px) / 1e9; break;
 			case COL_BID_SIZE:  p_u32[i][n] = L.bid_sz; break;
 			case COL_ASK_SIZE:  p_u32[i][n] = L.ask_sz; break;
 			case COL_BID_CT:    p_u32[i][n] = L.bid_ct; break;
@@ -842,7 +852,7 @@ static void Mbp10Scan(ClientContext &, TableFunctionInput &input, DataChunk &out
 			case COL_TS_RECV:  p_i64[i][n] = TsToInt64(rec.ts_recv); break;
 			case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
 			case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
-			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) / 1e9; break;
 			case COL_SIZE:     p_u32[i][n] = rec.size; break;
 			case COL_ACTION:   p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.action)); break;
 			case COL_SIDE:     p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
@@ -857,8 +867,8 @@ static void Mbp10Scan(ClientContext &, TableFunctionInput &input, DataChunk &out
 					const column_t sub    = offset % 6;
 					const auto &L = rec.levels[lvl];
 					switch (sub) {
-					case 0: p_dbl[i][n] = static_cast<double>(L.bid_px) * 1e-9; break;
-					case 1: p_dbl[i][n] = static_cast<double>(L.ask_px) * 1e-9; break;
+					case 0: p_dbl[i][n] = static_cast<double>(L.bid_px) / 1e9; break;
+					case 1: p_dbl[i][n] = static_cast<double>(L.ask_px) / 1e9; break;
 					case 2: p_u32[i][n] = L.bid_sz; break;
 					case 3: p_u32[i][n] = L.ask_sz; break;
 					case 4: p_u32[i][n] = L.bid_ct; break;
@@ -950,12 +960,12 @@ static void BboScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &o
 			case COL_TS_RECV:    p_i64[i][n] = TsToInt64(rec.ts_recv); break;
 			case COL_INSTR:      p_u32[i][n] = rec.hd.instrument_id; break;
 			case COL_PUB:        p_u16[i][n] = rec.hd.publisher_id; break;
-			case COL_PRICE:      p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+			case COL_PRICE:      p_dbl[i][n] = static_cast<double>(rec.price) / 1e9; break;
 			case COL_SIZE:       p_u32[i][n] = rec.size; break;
 			case COL_SIDE:       p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
 			case COL_FLAGS:      p_u8[i][n]  = rec.flags.Raw(); break;
-			case COL_BID_PRICE:  p_dbl[i][n] = static_cast<double>(L.bid_px) * 1e-9; break;
-			case COL_ASK_PRICE:  p_dbl[i][n] = static_cast<double>(L.ask_px) * 1e-9; break;
+			case COL_BID_PRICE:  p_dbl[i][n] = static_cast<double>(L.bid_px) / 1e9; break;
+			case COL_ASK_PRICE:  p_dbl[i][n] = static_cast<double>(L.ask_px) / 1e9; break;
 			case COL_BID_SIZE:   p_u32[i][n] = L.bid_sz; break;
 			case COL_ASK_SIZE:   p_u32[i][n] = L.ask_sz; break;
 			case COL_BID_CT:     p_u32[i][n] = L.bid_ct; break;
@@ -1050,12 +1060,12 @@ static void CbboScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &
 			case COL_TS_RECV:  p_i64[i][n] = TsToInt64(rec.ts_recv); break;
 			case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
 			case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
-			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) / 1e9; break;
 			case COL_SIZE:     p_u32[i][n] = rec.size; break;
 			case COL_SIDE:     p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
 			case COL_FLAGS:    p_u8[i][n]  = rec.flags.Raw(); break;
-			case COL_BID_PX:   p_dbl[i][n] = static_cast<double>(L.bid_px) * 1e-9; break;
-			case COL_ASK_PX:   p_dbl[i][n] = static_cast<double>(L.ask_px) * 1e-9; break;
+			case COL_BID_PX:   p_dbl[i][n] = static_cast<double>(L.bid_px) / 1e9; break;
+			case COL_ASK_PX:   p_dbl[i][n] = static_cast<double>(L.ask_px) / 1e9; break;
 			case COL_BID_SZ:   p_u32[i][n] = L.bid_sz; break;
 			case COL_ASK_SZ:   p_u32[i][n] = L.ask_sz; break;
 			case COL_BID_PB:   p_u16[i][n] = L.bid_pb; break;
@@ -1155,14 +1165,14 @@ static void Cmbp1ScanImpl(ClientContext &, TableFunctionInput &input, DataChunk 
 			case COL_TS_RECV:  p_i64[i][n] = TsToInt64(rec.ts_recv); break;
 			case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
 			case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
-			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+			case COL_PRICE:    p_dbl[i][n] = static_cast<double>(rec.price) / 1e9; break;
 			case COL_SIZE:     p_u32[i][n] = rec.size; break;
 			case COL_ACTION:   p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.action)); break;
 			case COL_SIDE:     p_str[i][n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.side)); break;
 			case COL_FLAGS:    p_u8[i][n]  = rec.flags.Raw(); break;
 			case COL_TS_IN_D:  p_i32[i][n] = static_cast<int32_t>(rec.ts_in_delta.count()); break;
-			case COL_BID_PX:   p_dbl[i][n] = static_cast<double>(L.bid_px) * 1e-9; break;
-			case COL_ASK_PX:   p_dbl[i][n] = static_cast<double>(L.ask_px) * 1e-9; break;
+			case COL_BID_PX:   p_dbl[i][n] = static_cast<double>(L.bid_px) / 1e9; break;
+			case COL_ASK_PX:   p_dbl[i][n] = static_cast<double>(L.ask_px) / 1e9; break;
 			case COL_BID_SZ:   p_u32[i][n] = L.bid_sz; break;
 			case COL_ASK_SZ:   p_u32[i][n] = L.ask_sz; break;
 			case COL_BID_PB:   p_u16[i][n] = L.bid_pb; break;
@@ -1243,10 +1253,10 @@ static void OhlcvScanImpl(ClientContext &, TableFunctionInput &input, DataChunk 
 			case COL_TS_EVENT: p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
 			case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
 			case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
-			case COL_OPEN:     p_dbl[i][n] = static_cast<double>(rec.open) * 1e-9; break;
-			case COL_HIGH:     p_dbl[i][n] = static_cast<double>(rec.high) * 1e-9; break;
-			case COL_LOW:      p_dbl[i][n] = static_cast<double>(rec.low) * 1e-9; break;
-			case COL_CLOSE:    p_dbl[i][n] = static_cast<double>(rec.close) * 1e-9; break;
+			case COL_OPEN:     p_dbl[i][n] = static_cast<double>(rec.open) / 1e9; break;
+			case COL_HIGH:     p_dbl[i][n] = static_cast<double>(rec.high) / 1e9; break;
+			case COL_LOW:      p_dbl[i][n] = static_cast<double>(rec.low) / 1e9; break;
+			case COL_CLOSE:    p_dbl[i][n] = static_cast<double>(rec.close) / 1e9; break;
 			case COL_VOLUME:   p_u64[i][n] = rec.volume; break;
 			default: break;
 			}
@@ -1460,14 +1470,14 @@ static void ImbalanceScan(ClientContext &, TableFunctionInput &input, DataChunk 
 			case COL_TS_RECV:       p_i64[i][n] = TsToInt64(rec.ts_recv); break;
 			case COL_INSTR:         p_u32[i][n] = rec.hd.instrument_id; break;
 			case COL_PUB:           p_u16[i][n] = rec.hd.publisher_id; break;
-			case COL_REF_PRICE:     p_dbl[i][n] = static_cast<double>(rec.ref_price) * 1e-9; break;
+			case COL_REF_PRICE:     p_dbl[i][n] = static_cast<double>(rec.ref_price) / 1e9; break;
 			case COL_AUCTION_TIME:  p_i64[i][n] = TsToInt64(rec.auction_time); break;
-			case COL_CONT_CLR:      p_dbl[i][n] = static_cast<double>(rec.cont_book_clr_price) * 1e-9; break;
-			case COL_AUCT_INT_CLR:  p_dbl[i][n] = static_cast<double>(rec.auct_interest_clr_price) * 1e-9; break;
-			case COL_SSR_FILL:      p_dbl[i][n] = static_cast<double>(rec.ssr_filling_price) * 1e-9; break;
-			case COL_IND_MATCH:     p_dbl[i][n] = static_cast<double>(rec.ind_match_price) * 1e-9; break;
-			case COL_UPPER_COLLAR:  p_dbl[i][n] = static_cast<double>(rec.upper_collar) * 1e-9; break;
-			case COL_LOWER_COLLAR:  p_dbl[i][n] = static_cast<double>(rec.lower_collar) * 1e-9; break;
+			case COL_CONT_CLR:      p_dbl[i][n] = static_cast<double>(rec.cont_book_clr_price) / 1e9; break;
+			case COL_AUCT_INT_CLR:  p_dbl[i][n] = static_cast<double>(rec.auct_interest_clr_price) / 1e9; break;
+			case COL_SSR_FILL:      p_dbl[i][n] = static_cast<double>(rec.ssr_filling_price) / 1e9; break;
+			case COL_IND_MATCH:     p_dbl[i][n] = static_cast<double>(rec.ind_match_price) / 1e9; break;
+			case COL_UPPER_COLLAR:  p_dbl[i][n] = static_cast<double>(rec.upper_collar) / 1e9; break;
+			case COL_LOWER_COLLAR:  p_dbl[i][n] = static_cast<double>(rec.lower_collar) / 1e9; break;
 			case COL_PAIRED_QTY:    p_u32[i][n] = rec.paired_qty; break;
 			case COL_TOTAL_IMB:     p_u32[i][n] = rec.total_imbalance_qty; break;
 			case COL_MKT_IMB:       p_u32[i][n] = rec.market_imbalance_qty; break;
@@ -1578,7 +1588,7 @@ static void StatisticsScan(ClientContext &, TableFunctionInput &input, DataChunk
 				case COL_TS_REF:        p_i64[i][n] = TsToInt64(rec.ts_ref); break;
 				case COL_INSTR:         p_u32[i][n] = rec.hd.instrument_id; break;
 				case COL_PUB:           p_u16[i][n] = rec.hd.publisher_id; break;
-				case COL_PRICE:         p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+				case COL_PRICE:         p_dbl[i][n] = static_cast<double>(rec.price) / 1e9; break;
 				case COL_QUANTITY:
 					if (rec.quantity == std::numeric_limits<std::int32_t>::max()) {
 						p_i64[i][n] = std::numeric_limits<std::int64_t>::max();
@@ -1609,7 +1619,7 @@ static void StatisticsScan(ClientContext &, TableFunctionInput &input, DataChunk
 				case COL_TS_REF:        p_i64[i][n] = TsToInt64(rec.ts_ref); break;
 				case COL_INSTR:         p_u32[i][n] = rec.hd.instrument_id; break;
 				case COL_PUB:           p_u16[i][n] = rec.hd.publisher_id; break;
-				case COL_PRICE:         p_dbl[i][n] = static_cast<double>(rec.price) * 1e-9; break;
+				case COL_PRICE:         p_dbl[i][n] = static_cast<double>(rec.price) / 1e9; break;
 				case COL_QUANTITY:      p_i64[i][n] = rec.quantity; break;
 				case COL_SEQUENCE:      p_u32[i][n] = rec.sequence; break;
 				case COL_TS_IN_DELTA:   p_i32[i][n] = static_cast<int32_t>(rec.ts_in_delta.count()); break;
@@ -1745,15 +1755,15 @@ static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk
 				case COL_UNIT_OF_MEASURE:    FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.UnitOfMeasure(), 31); break;
 				case COL_EXPIRATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count()); break;
 				case COL_ACTIVATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count()); break;
-				case COL_MIN_PRICE_INCREMENT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment) * 1e-9; break;
-				case COL_DISPLAY_FACTOR:     FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.display_factor) * 1e-9; break;
-				case COL_HIGH_LIMIT_PRICE:   FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.high_limit_price) * 1e-9; break;
-				case COL_LOW_LIMIT_PRICE:    FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.low_limit_price) * 1e-9; break;
-				case COL_MAX_PRICE_VARIATION: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.max_price_variation) * 1e-9; break;
-				case COL_STRIKE_PRICE:       FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.strike_price) * 1e-9; break;
-				case COL_UNIT_OF_MEASURE_QTY: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9; break;
-				case COL_MIN_PRICE_INCREMENT_AMOUNT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9; break;
-				case COL_PRICE_RATIO:        FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.price_ratio) * 1e-9; break;
+				case COL_MIN_PRICE_INCREMENT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment) / 1e9; break;
+				case COL_DISPLAY_FACTOR:     FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.display_factor) / 1e9; break;
+				case COL_HIGH_LIMIT_PRICE:   FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.high_limit_price) / 1e9; break;
+				case COL_LOW_LIMIT_PRICE:    FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.low_limit_price) / 1e9; break;
+				case COL_MAX_PRICE_VARIATION: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.max_price_variation) / 1e9; break;
+				case COL_STRIKE_PRICE:       FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.strike_price) / 1e9; break;
+				case COL_UNIT_OF_MEASURE_QTY: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.unit_of_measure_qty) / 1e9; break;
+				case COL_MIN_PRICE_INCREMENT_AMOUNT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment_amount) / 1e9; break;
+				case COL_PRICE_RATIO:        FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.price_ratio) / 1e9; break;
 				case COL_RAW_INSTRUMENT_ID:  FlatVector::GetData<uint64_t>(out.data[i])[n] = rec.raw_instrument_id; break;
 				case COL_UNDERLYING_ID:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.underlying_id; break;
 				case COL_INST_ATTRIB_VALUE:  FlatVector::GetData<int32_t>(out.data[i])[n] = rec.inst_attrib_value; break;
@@ -1791,8 +1801,8 @@ static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk
 				case COL_LEG_RAW_SYMBOL:     FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.LegRawSymbol(), 64); break;
 				case COL_LEG_INSTRUMENT_CLASS: FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.leg_instrument_class)); break;
 				case COL_LEG_SIDE:           FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitChar1(out.data[i], static_cast<char>(rec.leg_side)); break;
-				case COL_LEG_PRICE:          FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.leg_price) * 1e-9; break;
-				case COL_LEG_DELTA:          FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.leg_delta) * 1e-9; break;
+				case COL_LEG_PRICE:          FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.leg_price) / 1e9; break;
+				case COL_LEG_DELTA:          FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.leg_delta) / 1e9; break;
 				case COL_LEG_RATIO_PRICE_NUMERATOR:   FlatVector::GetData<int32_t>(out.data[i])[n] = rec.leg_ratio_price_numerator; break;
 				case COL_LEG_RATIO_PRICE_DENOMINATOR: FlatVector::GetData<int32_t>(out.data[i])[n] = rec.leg_ratio_price_denominator; break;
 				case COL_LEG_RATIO_QTY_NUMERATOR:     FlatVector::GetData<int32_t>(out.data[i])[n] = rec.leg_ratio_qty_numerator; break;
@@ -1834,15 +1844,15 @@ static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk
 				case COL_UNIT_OF_MEASURE:    FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.UnitOfMeasure(), 31); break;
 				case COL_EXPIRATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count()); break;
 				case COL_ACTIVATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count()); break;
-				case COL_MIN_PRICE_INCREMENT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment) * 1e-9; break;
-				case COL_DISPLAY_FACTOR:     FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.display_factor) * 1e-9; break;
-				case COL_HIGH_LIMIT_PRICE:   FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.high_limit_price) * 1e-9; break;
-				case COL_LOW_LIMIT_PRICE:    FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.low_limit_price) * 1e-9; break;
-				case COL_MAX_PRICE_VARIATION: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.max_price_variation) * 1e-9; break;
-				case COL_STRIKE_PRICE:       FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.strike_price) * 1e-9; break;
-				case COL_UNIT_OF_MEASURE_QTY: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9; break;
-				case COL_MIN_PRICE_INCREMENT_AMOUNT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9; break;
-				case COL_PRICE_RATIO:        FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.price_ratio) * 1e-9; break;
+				case COL_MIN_PRICE_INCREMENT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment) / 1e9; break;
+				case COL_DISPLAY_FACTOR:     FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.display_factor) / 1e9; break;
+				case COL_HIGH_LIMIT_PRICE:   FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.high_limit_price) / 1e9; break;
+				case COL_LOW_LIMIT_PRICE:    FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.low_limit_price) / 1e9; break;
+				case COL_MAX_PRICE_VARIATION: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.max_price_variation) / 1e9; break;
+				case COL_STRIKE_PRICE:       FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.strike_price) / 1e9; break;
+				case COL_UNIT_OF_MEASURE_QTY: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.unit_of_measure_qty) / 1e9; break;
+				case COL_MIN_PRICE_INCREMENT_AMOUNT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment_amount) / 1e9; break;
+				case COL_PRICE_RATIO:        FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.price_ratio) / 1e9; break;
 				case COL_RAW_INSTRUMENT_ID:  FlatVector::GetData<uint64_t>(out.data[i])[n] = static_cast<uint64_t>(rec.raw_instrument_id); break;
 				case COL_UNDERLYING_ID:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.underlying_id; break;
 				case COL_INST_ATTRIB_VALUE:  FlatVector::GetData<int32_t>(out.data[i])[n] = rec.inst_attrib_value; break;
@@ -1888,7 +1898,7 @@ static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk
 				case COL_LEG_RATIO_QTY_DENOMINATOR:
 				case COL_LEG_UNDERLYING_ID:
 					FlatVector::Validity(out.data[i]).SetInvalid(n); break;
-				case COL_TRADING_REFERENCE_PRICE: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.trading_reference_price) * 1e-9; break;
+				case COL_TRADING_REFERENCE_PRICE: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.trading_reference_price) / 1e9; break;
 				case COL_TRADING_REFERENCE_DATE:  FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.trading_reference_date; break;
 				case COL_MD_SECURITY_TRADING_STATUS: FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.md_security_trading_status; break;
 				case COL_SETTL_PRICE_TYPE:        FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.settl_price_type; break;
@@ -1923,15 +1933,15 @@ static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk
 				case COL_UNIT_OF_MEASURE:    FlatVector::GetData<string_t>(out.data[i])[n] = duckdb_dbn::EmitCstr(out.data[i], rec.UnitOfMeasure(), 31); break;
 				case COL_EXPIRATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.expiration).time_since_epoch().count()); break;
 				case COL_ACTIVATION:         FlatVector::GetData<int64_t>(out.data[i])[n] = static_cast<int64_t>((rec.activation).time_since_epoch().count()); break;
-				case COL_MIN_PRICE_INCREMENT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment) * 1e-9; break;
-				case COL_DISPLAY_FACTOR:     FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.display_factor) * 1e-9; break;
-				case COL_HIGH_LIMIT_PRICE:   FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.high_limit_price) * 1e-9; break;
-				case COL_LOW_LIMIT_PRICE:    FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.low_limit_price) * 1e-9; break;
-				case COL_MAX_PRICE_VARIATION: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.max_price_variation) * 1e-9; break;
-				case COL_STRIKE_PRICE:       FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.strike_price) * 1e-9; break;
-				case COL_UNIT_OF_MEASURE_QTY: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.unit_of_measure_qty) * 1e-9; break;
-				case COL_MIN_PRICE_INCREMENT_AMOUNT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment_amount) * 1e-9; break;
-				case COL_PRICE_RATIO:        FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.price_ratio) * 1e-9; break;
+				case COL_MIN_PRICE_INCREMENT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment) / 1e9; break;
+				case COL_DISPLAY_FACTOR:     FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.display_factor) / 1e9; break;
+				case COL_HIGH_LIMIT_PRICE:   FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.high_limit_price) / 1e9; break;
+				case COL_LOW_LIMIT_PRICE:    FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.low_limit_price) / 1e9; break;
+				case COL_MAX_PRICE_VARIATION: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.max_price_variation) / 1e9; break;
+				case COL_STRIKE_PRICE:       FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.strike_price) / 1e9; break;
+				case COL_UNIT_OF_MEASURE_QTY: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.unit_of_measure_qty) / 1e9; break;
+				case COL_MIN_PRICE_INCREMENT_AMOUNT: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.min_price_increment_amount) / 1e9; break;
+				case COL_PRICE_RATIO:        FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.price_ratio) / 1e9; break;
 				case COL_RAW_INSTRUMENT_ID:  FlatVector::GetData<uint64_t>(out.data[i])[n] = static_cast<uint64_t>(rec.raw_instrument_id); break;
 				case COL_UNDERLYING_ID:      FlatVector::GetData<uint32_t>(out.data[i])[n] = rec.underlying_id; break;
 				case COL_INST_ATTRIB_VALUE:  FlatVector::GetData<int32_t>(out.data[i])[n] = rec.inst_attrib_value; break;
@@ -1977,7 +1987,7 @@ static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk
 				case COL_LEG_RATIO_QTY_DENOMINATOR:
 				case COL_LEG_UNDERLYING_ID:
 					FlatVector::Validity(out.data[i]).SetInvalid(n); break;
-				case COL_TRADING_REFERENCE_PRICE: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.trading_reference_price) * 1e-9; break;
+				case COL_TRADING_REFERENCE_PRICE: FlatVector::GetData<double>(out.data[i])[n] = static_cast<double>(rec.trading_reference_price) / 1e9; break;
 				case COL_TRADING_REFERENCE_DATE:  FlatVector::GetData<uint16_t>(out.data[i])[n] = rec.trading_reference_date; break;
 				case COL_MD_SECURITY_TRADING_STATUS: FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.md_security_trading_status; break;
 				case COL_SETTL_PRICE_TYPE:        FlatVector::GetData<uint8_t>(out.data[i])[n] = rec.settl_price_type; break;
@@ -2284,8 +2294,8 @@ static unique_ptr<FunctionData> DbnRecordsBind(ClientContext &, TableFunctionBin
 
 static unique_ptr<GlobalTableFunctionState> DbnRecordsInitGlobal(ClientContext &, TableFunctionInitInput &input) {
 	auto &bd = input.bind_data->Cast<DbnRecordsBindData>();
-	auto hf = BuildHeaderFilter(input.filters, kHeaderLayoutRecords);
 	std::vector<column_t> col_ids = input.column_ids;
+	auto hf = BuildHeaderFilter(input.filters, col_ids, kHeaderLayoutRecords);
 	return make_uniq<DbnRecordsGlobalState>(bd.file_path, std::move(col_ids), std::move(hf));
 }
 
