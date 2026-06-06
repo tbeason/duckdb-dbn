@@ -2229,6 +2229,240 @@ static const char *STypeToCstr(databento::SType s) {
 	}
 }
 
+static const char *SystemCodeToCstr(databento::SystemCode c) {
+	switch (c) {
+	case databento::SystemCode::Heartbeat:         return "heartbeat";
+	case databento::SystemCode::SubscriptionAck:   return "subscription_ack";
+	case databento::SystemCode::SlowReaderWarning: return "slow_reader_warning";
+	case databento::SystemCode::ReplayCompleted:   return "replay_completed";
+	case databento::SystemCode::EndOfInterval:     return "end_of_interval";
+	case databento::SystemCode::Unset:             return "unset";
+	default:                                       return "unknown";
+	}
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// symbol_mapping — SymbolMappingMsg, RType::SymbolMapping (0x16).
+//   v2/v3 (176 B): hd + stype_in + stype_in_symbol[71] + stype_out +
+//                  stype_out_symbol[71] + start_ts + end_ts
+//   v1     (80 B): hd + stype_in_symbol[22] + stype_out_symbol[22] +
+//                  _dummy[4] + start_ts + end_ts (no stype_in/stype_out enums)
+// Live-session record interleaved alongside market data; carries the
+// raw-symbol ↔ instrument_id binding that metadata.symbols is missing
+// for live captures. Layout: kHeaderLayoutOhlcv (no ts_recv).
+// ═════════════════════════════════════════════════════════════════════════════
+
+static unique_ptr<FunctionData> SymbolMappingBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto bd = make_uniq<ReadDbnBindData>();
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
+	bd->header_layout = kHeaderLayoutOhlcv;
+	names = {"ts_event", "instrument_id", "publisher_id",
+	         "stype_in", "stype_in_symbol",
+	         "stype_out", "stype_out_symbol",
+	         "start_ts", "end_ts"};
+	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::UINTEGER,    LogicalType::USMALLINT,
+	                LogicalType::VARCHAR,      LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,      LogicalType::VARCHAR,
+	                LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS};
+	return std::move(bd);
+}
+
+static void SymbolMappingScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
+	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0,  COL_INSTR = 1,           COL_PUB = 2,
+		COL_STYPE_IN = 3,  COL_STYPE_IN_SYM = 4,
+		COL_STYPE_OUT = 5, COL_STYPE_OUT_SYM = 6,
+		COL_START_TS = 7,  COL_END_TS = 8,
+	};
+
+	std::array<int64_t *,  16> p_i64 {};
+	std::array<uint32_t *, 16> p_u32 {};
+	std::array<uint16_t *, 16> p_u16 {};
+	std::array<string_t *, 16> p_str {};
+	D_ASSERT(projected_count <= 16);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT:      p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:         p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:           p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_STYPE_IN:      p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_STYPE_IN_SYM:  p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_STYPE_OUT:     p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_STYPE_OUT_SYM: p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_START_TS:      p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_END_TS:        p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		default: break;
+		}
+	}
+
+	const auto version = st.reader->Version();
+	idx_t n = 0;
+	if (version >= 2) {
+		databento::SymbolMappingMsg rec {};
+		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::SymbolMapping)) {
+			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			for (idx_t i = 0; i < projected_count; ++i) {
+				const auto cid = col_ids[i];
+				switch (cid) {
+				case COL_TS_EVENT:      p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+				case COL_INSTR:         p_u32[i][n] = rec.hd.instrument_id; break;
+				case COL_PUB:           p_u16[i][n] = rec.hd.publisher_id; break;
+				case COL_STYPE_IN:
+					// 0xFF is Databento's "unset" sentinel — live captures use it
+					// because the writer doesn't always know the stype.
+					if (static_cast<uint8_t>(rec.stype_in) == 0xFF) {
+						FlatVector::Validity(out.data[i]).SetInvalid(n);
+					} else {
+						p_str[i][n] = StringVector::AddString(out.data[i], STypeToCstr(rec.stype_in));
+					}
+					break;
+				case COL_STYPE_IN_SYM:  p_str[i][n] = duckdb_dbn::EmitCstr(out.data[i], rec.stype_in_symbol.data(), rec.stype_in_symbol.size()); break;
+				case COL_STYPE_OUT:
+					if (static_cast<uint8_t>(rec.stype_out) == 0xFF) {
+						FlatVector::Validity(out.data[i]).SetInvalid(n);
+					} else {
+						p_str[i][n] = StringVector::AddString(out.data[i], STypeToCstr(rec.stype_out));
+					}
+					break;
+				case COL_STYPE_OUT_SYM: p_str[i][n] = duckdb_dbn::EmitCstr(out.data[i], rec.stype_out_symbol.data(), rec.stype_out_symbol.size()); break;
+				case COL_START_TS:      p_i64[i][n] = TsToInt64(rec.start_ts); break;
+				case COL_END_TS:        p_i64[i][n] = TsToInt64(rec.end_ts); break;
+				default: break;
+				}
+			}
+			++n;
+		}
+	} else {
+		databento::v1::SymbolMappingMsg rec {};
+		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::SymbolMapping)) {
+			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			for (idx_t i = 0; i < projected_count; ++i) {
+				const auto cid = col_ids[i];
+				switch (cid) {
+				case COL_TS_EVENT:      p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+				case COL_INSTR:         p_u32[i][n] = rec.hd.instrument_id; break;
+				case COL_PUB:           p_u16[i][n] = rec.hd.publisher_id; break;
+				case COL_STYPE_IN:      FlatVector::Validity(out.data[i]).SetInvalid(n); break;
+				case COL_STYPE_IN_SYM:  p_str[i][n] = duckdb_dbn::EmitCstr(out.data[i], rec.stype_in_symbol.data(), rec.stype_in_symbol.size()); break;
+				case COL_STYPE_OUT:     FlatVector::Validity(out.data[i]).SetInvalid(n); break;
+				case COL_STYPE_OUT_SYM: p_str[i][n] = duckdb_dbn::EmitCstr(out.data[i], rec.stype_out_symbol.data(), rec.stype_out_symbol.size()); break;
+				case COL_START_TS:      p_i64[i][n] = TsToInt64(rec.start_ts); break;
+				case COL_END_TS:        p_i64[i][n] = TsToInt64(rec.end_ts); break;
+				default: break;
+				}
+			}
+			++n;
+		}
+	}
+	out.SetCardinality(n);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// system — SystemMsg, RType::System (0x17).
+//   v2/v3 (320 B): hd + msg[303] + code (SystemCode enum)
+//   v1     (80 B): hd + msg[64] (no code; code emitted as SQL NULL)
+// Gateway session messages: heartbeat, subscription_ack, slow_reader_warning,
+// replay_completed, end_of_interval. Layout: kHeaderLayoutOhlcv.
+// ═════════════════════════════════════════════════════════════════════════════
+
+static unique_ptr<FunctionData> SystemBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	auto bd = make_uniq<ReadDbnBindData>();
+	bd->file_paths = ExpandPaths(context, GetFilePathArg(input));
+	bd->header_layout = kHeaderLayoutOhlcv;
+	names = {"ts_event", "instrument_id", "publisher_id", "msg", "code"};
+	return_types = {LogicalType::TIMESTAMP_NS, LogicalType::UINTEGER, LogicalType::USMALLINT,
+	                LogicalType::VARCHAR,      LogicalType::VARCHAR};
+	return std::move(bd);
+}
+
+static void SystemScan(ClientContext &, TableFunctionInput &input, DataChunk &out) {
+	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
+	const auto &col_ids = st.column_ids;
+	const idx_t projected_count = col_ids.size();
+	D_ASSERT(out.data.size() == projected_count);
+
+	enum : column_t {
+		COL_TS_EVENT = 0, COL_INSTR = 1, COL_PUB = 2,
+		COL_MSG = 3,      COL_CODE = 4,
+	};
+
+	std::array<int64_t *,  16> p_i64 {};
+	std::array<uint32_t *, 16> p_u32 {};
+	std::array<uint16_t *, 16> p_u16 {};
+	std::array<string_t *, 16> p_str {};
+	D_ASSERT(projected_count <= 16);
+
+	for (idx_t i = 0; i < projected_count; ++i) {
+		const auto cid = col_ids[i];
+		if (cid == COLUMN_IDENTIFIER_ROW_ID) { continue; }
+		switch (cid) {
+		case COL_TS_EVENT: p_i64[i] = FlatVector::GetData<int64_t>(out.data[i]); break;
+		case COL_INSTR:    p_u32[i] = FlatVector::GetData<uint32_t>(out.data[i]); break;
+		case COL_PUB:      p_u16[i] = FlatVector::GetData<uint16_t>(out.data[i]); break;
+		case COL_MSG:      p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		case COL_CODE:     p_str[i] = FlatVector::GetData<string_t>(out.data[i]); break;
+		default: break;
+		}
+	}
+
+	const auto version = st.reader->Version();
+	idx_t n = 0;
+	if (version >= 2) {
+		databento::SystemMsg rec {};
+		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::System)) {
+			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			for (idx_t i = 0; i < projected_count; ++i) {
+				const auto cid = col_ids[i];
+				switch (cid) {
+				case COL_TS_EVENT: p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+				case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
+				case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
+				case COL_MSG:      p_str[i][n] = duckdb_dbn::EmitCstr(out.data[i], rec.msg.data(), rec.msg.size()); break;
+				case COL_CODE:
+					// SystemCode::Unset (255) means the field wasn't set by the
+					// writer — semantically equivalent to NULL.
+					if (rec.code == databento::SystemCode::Unset) {
+						FlatVector::Validity(out.data[i]).SetInvalid(n);
+					} else {
+						p_str[i][n] = StringVector::AddString(out.data[i], SystemCodeToCstr(rec.code));
+					}
+					break;
+				default: break;
+				}
+			}
+			++n;
+		}
+	} else {
+		databento::v1::SystemMsg rec {};
+		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::System)) {
+			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			for (idx_t i = 0; i < projected_count; ++i) {
+				const auto cid = col_ids[i];
+				switch (cid) {
+				case COL_TS_EVENT: p_i64[i][n] = TsToInt64(rec.hd.ts_event); break;
+				case COL_INSTR:    p_u32[i][n] = rec.hd.instrument_id; break;
+				case COL_PUB:      p_u16[i][n] = rec.hd.publisher_id; break;
+				case COL_MSG:      p_str[i][n] = duckdb_dbn::EmitCstr(out.data[i], rec.msg.data(), rec.msg.size()); break;
+				case COL_CODE:     FlatVector::Validity(out.data[i]).SetInvalid(n); break;
+				default: break;
+				}
+			}
+			++n;
+		}
+	}
+	out.SetCardinality(n);
+}
+
 struct ReadDbnBindDataPolymorphic : public ReadDbnBindData {
 	table_function_t dispatched_scan = nullptr;
 };
@@ -2540,6 +2774,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	Register<Cbbo1mScan>(loader, "read_dbn_cbbo_1m", CbboBind);
 	Register<OhlcvEodScan>(loader, "read_dbn_ohlcv_eod", OhlcvBind);
 	Register<TcbboScan>(loader, "read_dbn_tcbbo", Cmbp1Bind);
+	Register<SymbolMappingScan>(loader, "read_dbn_symbol_mapping", SymbolMappingBind);
+	Register<SystemScan>(loader, "read_dbn_system", SystemBind);
 
 	TableFunction mf("dbn_metadata", {LogicalType::VARCHAR}, DbnMetadataScan, DbnMetadataBind, DbnMetadataInitGlobal);
 	loader.RegisterFunction(mf);

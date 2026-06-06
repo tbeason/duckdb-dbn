@@ -38,7 +38,7 @@ Layout offsets are derived from write_header in DBN.jl/src/encode.jl.
 using DatabentoBinaryEncoding
 const DBN = DatabentoBinaryEncoding
 using DatabentoBinaryEncoding: RecordHeader, BidAskPair, Metadata,
-    TradeMsg, OHLCVMsg, CBBO1mMsg, TCBBOMsg,
+    TradeMsg, OHLCVMsg, CBBO1mMsg, TCBBOMsg, SymbolMappingMsg,
     RType, Schema, SType, Action, Side, write_dbn
 
 const REPO = dirname(@__DIR__)
@@ -207,12 +207,104 @@ function gen_ohlcv_eod()
             " records, schema/rtype patched to OHLCV_EOD)")
 end
 
+# ---------------------------------------------------------------------------
+# symbol_mapping fixture: 3 SymbolMappingMsg records over a small ESH1 →
+# 5482 mapping. DBN.jl's SymbolMappingMsg encoder writes the canonical
+# v2/v3 wire layout (1 + 71 + 1 + 71 + 8 + 8 = 160 body bytes), so this is
+# a straight write_dbn call. Includes one record with stype=0xFF (the
+# "unset" sentinel live captures use) to test the NULL emission path.
+
+function gen_symbol_mapping()
+    # Canonical v2/v3 SymbolMappingMsg = 176 bytes = 44 four-byte units. We
+    # can't use len_units(SymbolMappingMsg) because the Julia struct holds
+    # `String` references (variable size), so sizeof() returns 16, not 176.
+    L = UInt8(44)
+    records = SymbolMappingMsg[
+        # Two records with valid stype enums.
+        SymbolMappingMsg(
+            RecordHeader(L, RType.SYMBOL_MAPPING_MSG, PUB_ID, UInt32(5482), T0),
+            SType.RAW_SYMBOL, "ESH1",
+            SType.INSTRUMENT_ID, "5482",
+            T0, T0 + 86_400_000_000_000,
+        ),
+        SymbolMappingMsg(
+            RecordHeader(L, RType.SYMBOL_MAPPING_MSG, PUB_ID, UInt32(6001), T0 + 1_000_000_000),
+            SType.PARENT, "ES.FUT",
+            SType.INSTRUMENT_ID, "6001",
+            T0, T0 + 86_400_000_000_000,
+        ),
+        # One record with stype set to the 0xFF "unset" sentinel — exercises
+        # the NULL emission path in the reader.
+        SymbolMappingMsg(
+            RecordHeader(L, RType.SYMBOL_MAPPING_MSG, PUB_ID, UInt32(6002), T0 + 2_000_000_000),
+            reinterpret(SType.T, UInt8(0xFF)), "SPX.OPT",
+            reinterpret(SType.T, UInt8(0xFF)), "SPX   271217C02800000",
+            T0, T0 + 86_400_000_000_000,
+        ),
+    ]
+    md = base_metadata(Schema.MBO)  # No SymbolMapping schema enum; metadata.schema is informational
+    write_dbn(joinpath(DATA, "test_data.symbol_mapping.dbn"), md, records)
+    println("  ok   test_data.symbol_mapping.dbn (", length(records), " records)")
+end
+
+# ---------------------------------------------------------------------------
+# system fixture: hand-write raw bytes since DBN.jl's SystemMsg encoder
+# uses a non-canonical layout (msg + NUL + code + NUL padded). Canonical
+# v2/v3 SystemMsg is hd(16) + msg[303] + code(1) = 320 bytes. Two records:
+# one heartbeat (code=0), one subscription_ack (code=1).
+
+const SYSTEM_RTYPE = UInt8(0x17)         # RType::System
+const SYSTEM_REC_BYTES = 320              # canonical v2/v3 record size
+const SYSTEM_REC_LEN_UNITS = UInt8(SYSTEM_REC_BYTES ÷ 4)
+
+function write_canonical_system_record(io::IO, instrument_id::UInt32, ts_event::Int64,
+                                       msg::String, code::UInt8)
+    # RecordHeader (16 bytes): length(1) | rtype(1) | publisher_id(2 LE) |
+    # instrument_id(4 LE) | ts_event(8 LE)
+    write(io, SYSTEM_REC_LEN_UNITS)
+    write(io, SYSTEM_RTYPE)
+    write(io, htol(PUB_ID))
+    write(io, htol(instrument_id))
+    write(io, htol(ts_event))
+    # msg[303]: write up to 302 chars + NUL terminator, pad zeros.
+    msg_bytes = Vector{UInt8}(msg)
+    copy_len = min(length(msg_bytes), 302)
+    write(io, view(msg_bytes, 1:copy_len))
+    write(io, zeros(UInt8, 303 - copy_len))
+    # code(1): the SystemCode enum byte.
+    write(io, code)
+end
+
+function gen_system()
+    metadata = base_metadata(Schema.MBO)
+    out_path = joinpath(DATA, "test_data.system.dbn")
+    # Write header via DBN.jl's encoder (headers are canonical), then patch
+    # the records by reading the file back and overwriting the body.
+    write_dbn(out_path, metadata, TradeMsg[])  # header-only with zero records
+    bytes = read(out_path)
+    @assert bytes[1:3] == b"DBN"
+    md_len = UInt32(bytes[5]) | (UInt32(bytes[6]) << 8) |
+             (UInt32(bytes[7]) << 16) | (UInt32(bytes[8]) << 24)
+    body_start = 8 + Int(md_len)
+    @assert body_start == length(bytes) "expected header-only file"
+    # Append two canonical SystemMsg records.
+    open(out_path, "a") do io
+        write_canonical_system_record(io, UInt32(0), T0,
+                                      "Heartbeat", UInt8(0))                        # SystemCode::Heartbeat
+        write_canonical_system_record(io, UInt32(0), T0 + 1_000_000_000,
+                                      "Subscription acknowledged", UInt8(1))         # SystemCode::SubscriptionAck
+    end
+    println("  ok   test_data.system.dbn (2 records, raw canonical layout)")
+end
+
 function main()
     isdir(DATA) || error("data dir does not exist: $DATA")
     gen_trades_empty()
     gen_cbbo_1m()
     gen_tcbbo()
     gen_ohlcv_eod()
+    gen_symbol_mapping()
+    gen_system()
     return 0
 end
 

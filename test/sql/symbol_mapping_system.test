@@ -1,0 +1,100 @@
+# name: test/sql/symbol_mapping_system.test
+# description: Live-gateway record schemas — read_dbn_symbol_mapping() and
+#              read_dbn_system(). These rtypes are filtered out by the
+#              market-data readers (rtype-mismatched) and are how live
+#              captures carry raw-symbol↔instrument_id bindings and gateway
+#              session state.
+# group: [sql]
+
+require dbn
+
+# ──────────────────────────────────────────────────────────────────────────
+# symbol_mapping — 3 records: 2 with valid stype enums, 1 with stype=0xFF
+# (Databento's "unset" sentinel) which the reader emits as SQL NULL.
+# ──────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) FROM read_dbn_symbol_mapping('test/data/test_data.symbol_mapping.dbn')
+----
+3
+
+# stype decoding for known enum values.
+query TT
+SELECT stype_in, stype_out
+FROM read_dbn_symbol_mapping('test/data/test_data.symbol_mapping.dbn')
+WHERE instrument_id IN (5482, 6001)
+ORDER BY instrument_id
+----
+raw_symbol	instrument_id
+parent	instrument_id
+
+# stype=0xFF emits SQL NULL (not "unknown", not the literal "unset").
+query II
+SELECT stype_in IS NULL, stype_out IS NULL
+FROM read_dbn_symbol_mapping('test/data/test_data.symbol_mapping.dbn')
+WHERE instrument_id = 6002
+----
+true	true
+
+# Symbol fields are extracted as VARCHAR.
+query TT
+SELECT stype_in_symbol, stype_out_symbol
+FROM read_dbn_symbol_mapping('test/data/test_data.symbol_mapping.dbn')
+WHERE instrument_id = 6002
+----
+SPX.OPT	SPX   271217C02800000
+
+# Filter pushdown on instrument_id (header column) still works.
+query I
+SELECT count(*) FROM read_dbn_symbol_mapping('test/data/test_data.symbol_mapping.dbn')
+WHERE instrument_id = 9999
+----
+0
+
+# Filter pushdown on stype_out_symbol (body column).
+query I
+SELECT count(*) FROM read_dbn_symbol_mapping('test/data/test_data.symbol_mapping.dbn')
+WHERE stype_out_symbol = '5482'
+----
+1
+
+# ──────────────────────────────────────────────────────────────────────────
+# system — 2 records: heartbeat (code=0) and subscription_ack (code=1).
+# ──────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) FROM read_dbn_system('test/data/test_data.system.dbn')
+----
+2
+
+# code enum decoding.
+query TT
+SELECT msg, code
+FROM read_dbn_system('test/data/test_data.system.dbn')
+ORDER BY ts_event
+----
+Heartbeat	heartbeat
+Subscription acknowledged	subscription_ack
+
+# Body-column filter on code.
+query I
+SELECT count(*) FROM read_dbn_system('test/data/test_data.system.dbn')
+WHERE code = 'heartbeat'
+----
+1
+
+# ──────────────────────────────────────────────────────────────────────────
+# Cross-reader sanity — the market-data readers correctly skip these rtypes
+# (the live-stream behavior we depend on). A market-data reader pointed at
+# a symbol_mapping-only file should return zero rows.
+# ──────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.symbol_mapping.dbn')
+----
+0
+
+query I
+SELECT count(*) FROM read_dbn_symbol_mapping('test/data/test_data.trades.dbn')
+----
+0
