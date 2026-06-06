@@ -359,18 +359,17 @@ static DbnHeaderFilter BuildHeaderFilter(optional_ptr<TableFilterSet> filters,
 // that motivated the temporary filter_pushdown=false from commit 307ff92.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void ApplyBodyFilters(ClientContext &context,
-                             optional_ptr<TableFilterSet> filters,
-                             const std::vector<column_t> &column_ids,
-                             const DbnHeaderColumnLayout &layout,
-                             DataChunk &chunk) {
-	if (!filters || chunk.size() == 0) {
-		return;
-	}
-	// Collect filters on body columns (header filters are already applied
-	// per-record inside the scan loop via DbnHeaderFilter::Matches).
+// Build the AND'd body-filter Expression from the pushed-down TableFilterSet.
+// Header-column filters (ts_event / instrument_id / publisher_id) are skipped —
+// they're applied per-record inside the scan loop by DbnHeaderFilter::Matches.
+// Column types are read from the supplied chunk's vectors (which match the
+// projected schema). Returns nullptr if there are no body filters to apply.
+static unique_ptr<Expression> BuildBodyFilterExpr(const TableFilterSet &filters,
+                                                  const std::vector<column_t> &column_ids,
+                                                  const DbnHeaderColumnLayout &layout,
+                                                  const DataChunk &chunk) {
 	vector<unique_ptr<Expression>> filter_exprs;
-	for (auto &entry : filters->filters) {
+	for (auto &entry : filters.filters) {
 		const auto pidx = entry.first;
 		if (pidx >= column_ids.size()) {
 			continue;
@@ -387,20 +386,25 @@ static void ApplyBodyFilters(ClientContext &context,
 		filter_exprs.push_back(entry.second->ToExpression(*col_ref));
 	}
 	if (filter_exprs.empty()) {
-		return;
+		return nullptr;
 	}
-	// AND together if multiple.
-	unique_ptr<Expression> root;
 	if (filter_exprs.size() == 1) {
-		root = std::move(filter_exprs[0]);
-	} else {
-		auto conj = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-		for (auto &e : filter_exprs) {
-			conj->children.push_back(std::move(e));
-		}
-		root = std::move(conj);
+		return std::move(filter_exprs[0]);
 	}
-	ExpressionExecutor executor(context, *root);
+	auto conj = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+	for (auto &e : filter_exprs) {
+		conj->children.push_back(std::move(e));
+	}
+	return std::move(conj);
+}
+
+// Evaluate the cached body-filter Expression against `chunk` and slice down
+// to the rows that match. Cheap no-op if `expr` is null. ExpressionExecutor
+// is reconstructed per call: its state is per-pipeline and constructing
+// from a const Expression is inexpensive compared to evaluating against
+// STANDARD_VECTOR_SIZE rows.
+static void EvalBodyFilterExpr(ClientContext &context, const Expression &expr, DataChunk &chunk) {
+	ExpressionExecutor executor(context, expr);
 	SelectionVector sel(STANDARD_VECTOR_SIZE);
 	const idx_t pass = executor.SelectExpression(chunk, sel);
 	if (pass < chunk.size()) {
@@ -436,10 +440,16 @@ struct ReadDbnGlobalState : public GlobalTableFunctionState {
 	// as "skip, no output to fill for this slot" since we never emit row ids.
 	std::vector<column_t> column_ids;
 	DbnHeaderFilter header_filter;
-	// Deep copy of the pushed-down filter set, stashed at init so scan-time
-	// ApplyBodyFilters can reach it. TableFunctionInput (scan) doesn't
-	// expose filters — only TableFunctionInitInput does.
+	// Deep copy of the pushed-down filter set, stashed at init so the scan
+	// wrapper can build/cache the body-filter Expression. TableFunctionInput
+	// (scan) doesn't expose filters — only TableFunctionInitInput does.
 	unique_ptr<TableFilterSet> filters;
+	// Cached body-filter Expression, built lazily on the first scan call
+	// (need a DataChunk in hand for projected column types). nullptr both
+	// before init and when there are no body filters to apply.
+	// `body_filter_built` distinguishes "not yet built" from "built, no-op".
+	unique_ptr<Expression> body_filter_expr;
+	bool body_filter_built = false;
 };
 
 static unique_ptr<GlobalTableFunctionState>
@@ -2357,8 +2367,11 @@ struct DbnRecordsGlobalState : public GlobalTableFunctionState {
 	std::unique_ptr<duckdb_dbn::DbnFileReader> reader;
 	std::vector<column_t> column_ids;
 	DbnHeaderFilter header_filter;
-	// Deep copy of pushed-down filter set (see ReadDbnGlobalState).
+	// Pushed-down filter set + cached body-filter Expression
+	// (see ReadDbnGlobalState for the lazy-init pattern).
 	unique_ptr<TableFilterSet> filters;
+	unique_ptr<Expression> body_filter_expr;
+	bool body_filter_built = false;
 };
 
 static unique_ptr<FunctionData> DbnRecordsBind(ClientContext &, TableFunctionBindInput &input,
@@ -2483,8 +2496,17 @@ static void ScanWithBodyFilter(ClientContext &c, TableFunctionInput &input, Data
 	if (!st.filters) {
 		return;
 	}
-	auto &bd = input.bind_data->Cast<ReadDbnBindData>();
-	ApplyBodyFilters(c, st.filters.get(), st.column_ids, bd.header_layout, out);
+	// Build the Expression once on the first chunk that has data (need a
+	// populated DataChunk for projected column types), then reuse.
+	if (!st.body_filter_built) {
+		auto &bd = input.bind_data->Cast<ReadDbnBindData>();
+		st.body_filter_expr = BuildBodyFilterExpr(*st.filters, st.column_ids,
+		                                          bd.header_layout, out);
+		st.body_filter_built = true;
+	}
+	if (st.body_filter_expr) {
+		EvalBodyFilterExpr(c, *st.body_filter_expr, out);
+	}
 }
 
 template <table_function_t Inner>
@@ -2533,7 +2555,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 		if (!st.filters) {
 			return;
 		}
-		ApplyBodyFilters(c, st.filters.get(), st.column_ids, kHeaderLayoutRecords, out);
+		if (!st.body_filter_built) {
+			st.body_filter_expr = BuildBodyFilterExpr(*st.filters, st.column_ids,
+			                                          kHeaderLayoutRecords, out);
+			st.body_filter_built = true;
+		}
+		if (st.body_filter_expr) {
+			EvalBodyFilterExpr(c, *st.body_filter_expr, out);
+		}
 	};
 	TableFunction rf("dbn_records", {LogicalType::VARCHAR}, records_scan, DbnRecordsBind, DbnRecordsInitGlobal);
 	rf.projection_pushdown = true;

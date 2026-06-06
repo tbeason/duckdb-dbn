@@ -69,17 +69,54 @@ make
 ```
 
 **Option B — direct CMake invocation (more reliable on Windows):**
-```powershell
-cmake -B build/release -S . `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_TOOLCHAIN_PATH" `
-  -DEXTENSION_STATIC_BUILD=1 `
-  -DDUCKDB_EXTENSION_CONFIGS="$PWD\extension_config.cmake"
 
-cmake --build build/release --config Release
+> **Critical: choose your architecture.** Calling `cmake -B build/release -S .`
+> from a plain shell on this machine picks the 32-bit (x86) toolchain by
+> default — that caps the entire build (and runtime!) at ~2 GB virtual
+> address space, which OOMs on any non-trivial DBN file. Use `vcvars64.bat`
+> and pass `-S duckdb -DVCPKG_TARGET_TRIPLET=x64-windows` explicitly.
+
+```powershell
+# x64 release build (do this from a plain PowerShell, not the dev shell —
+# the `vcvars64.bat` call inside `cmd /c` sets the toolchain for the
+# embedded cmake invocation):
+$repo = "C:\Users\tbeas\Documents\GitHub\duckdb-dbn"
+cd $repo
+cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" && ' +
+       'cmake -G Ninja -S duckdb -B build\release ' +
+       '-DCMAKE_BUILD_TYPE=Release ' +
+       '-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake ' +
+       '-DVCPKG_TARGET_TRIPLET=x64-windows ' +
+       "-DVCPKG_MANIFEST_DIR=$repo " +
+       '-DEXTENSION_STATIC_BUILD=1 ' +
+       "-DDUCKDB_EXTENSION_CONFIGS=$repo\extension_config.cmake"
+
+cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" && ' +
+       'cmake --build build\release --config Release ' +
+       '--target dbn_extension dbn_loadable_extension unittest shell'
+```
+
+The `-S duckdb` (not `-S .`) is required — `CMakeLists.txt` at the repo
+root is the extension's own config; the build wants the DuckDB submodule
+as its source. The Makefile wrapper does this automatically.
+
+Verify the resulting binary is 64-bit:
+```powershell
+$b = [IO.File]::ReadAllBytes("build\release\duckdb.exe")
+$pe = [BitConverter]::ToInt32($b, 0x3C)
+switch ([BitConverter]::ToUInt16($b, $pe + 4)) {
+    0x8664 { "x64 (good)" }
+    0x014c { "x86 (rebuild with vcvars64)" }
+}
 ```
 
 First build is slow (vcpkg compiles OpenSSL; DuckDB itself compiles). Subsequent rebuilds use the cache. Expect 15–30 minutes for the first run.
+
+**Switching architectures.** vcpkg caches the *x86* and *x64* triplets in
+different `build/release/vcpkg_installed/` subdirs, so the `build/release`
+tree is architecture-specific. To switch (e.g. from a legacy x86 build to
+x64), wipe `build/release` and re-configure — don't try to incrementally
+rebuild.
 
 ### 5. Locate and load the extension
 
