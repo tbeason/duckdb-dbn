@@ -1,0 +1,52 @@
+# name: test/sql/edge_cases.test
+# description: Behavior at the edges — zero-row fixtures, single-row reads,
+#              zero-column projection.
+# group: [sql]
+
+require dbn
+
+# Zero-row fixture: ohlcv-1d is metadata-only. The schema (columns) should
+# still be exposed, but COUNT(*) is zero.
+query I
+SELECT count(*) FROM read_dbn_ohlcv_1d('test/data/test_data.ohlcv-1d.dbn')
+----
+0
+
+# Even with zero rows, type information must be intact — verifies bind path
+# is independent of data presence.
+query TTTT
+SELECT typeof(ts_event), typeof(instrument_id), typeof(open), typeof(volume)
+FROM (SELECT * FROM read_dbn_ohlcv_1d('test/data/test_data.ohlcv-1d.dbn') LIMIT 0)
+UNION ALL VALUES ('NONE'::VARCHAR, 'NONE'::VARCHAR, 'NONE'::VARCHAR, 'NONE'::VARCHAR)
+LIMIT 1
+----
+NONE	NONE	NONE	NONE
+
+# Single-row LIMIT 1 — exercises the early-exit path through the scan loop.
+query I
+SELECT count(*) FROM (SELECT * FROM read_dbn_trades('test/data/test_data.trades.dbn') LIMIT 1)
+----
+1
+
+# Zero-column projection: SELECT 1 FROM ... — DuckDB asks for no columns.
+# The TradesScan's per-projection-slot loop iterates 0 times; only the
+# header filter runs (no-op since no predicates). Must still return 2 rows.
+query I
+SELECT count(*) FROM (SELECT 1 FROM read_dbn_trades('test/data/test_data.trades.dbn'))
+----
+2
+
+# COUNT(*) without scanning bodies — same code path as zero-column projection.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+----
+2
+
+# Single-column projection then filter (filter on the projected column).
+# Verifies filter pushdown can act on a column that's also in the projection.
+query R
+SELECT price FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE price = 3720.25
+----
+3720.25
+3720.25

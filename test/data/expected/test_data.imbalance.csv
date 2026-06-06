@@ -1,0 +1,3 @@
+ts_recv,ts_event,publisher_id,instrument_id,ref_price,auction_time,cont_book_clr_price,auct_interest_clr_price,ssr_filling_price,ind_match_price,upper_collar,lower_collar,paired_qty,total_imbalance_qty,market_imbalance_qty,unpaired_qty,auction_type,side,auction_status,freeze_status,num_extensions,unpaired_side,significant_imbalance
+1633353900633864350,1633353900633854579,2,9439,229430000000,0,0,0,0,0,0,0,0,2000,0,0,O,B,0,0,0,N,~
+1633353910208124734,1633353910208114778,2,9439,229990000000,0,0,0,0,0,0,0,1719,281,0,0,O,B,0,0,0,N,~

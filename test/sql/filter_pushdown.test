@@ -1,0 +1,158 @@
+# name: test/sql/filter_pushdown.test
+# description: Verify filter pushdown correctness. For each TableFilter shape
+#              DuckDB hands us (ConstantFilter, InFilter, ConjunctionAndFilter,
+#              OptionalFilter), assert that the row set returned by the
+#              extension matches the same predicate evaluated against the
+#              golden CSV — including across schemas with non-standard
+#              header layouts (OHLCV: no ts_recv; Statistics: custom).
+# group: [sql]
+
+require dbn
+
+# ──────────────────────────────────────────────────────────────────────────
+# trades — Standard layout
+# ──────────────────────────────────────────────────────────────────────────
+
+# ConstantFilter on instrument_id: every fixture row has instrument_id=5482,
+# so this should return all 2 rows. Compare row count + price ordering.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE instrument_id = 5482
+----
+2
+
+# Same predicate evaluated against the golden CSV — must agree.
+query I
+SELECT count(*) FROM read_csv('test/data/expected/test_data.trades.csv',
+                              header=true,
+                              columns={'ts_event': 'BIGINT', 'ts_recv': 'BIGINT',
+                                       'instrument_id': 'UINTEGER', 'publisher_id': 'USMALLINT',
+                                       'price': 'DOUBLE', 'size': 'UINTEGER',
+                                       'action': 'VARCHAR', 'side': 'VARCHAR',
+                                       'flags': 'UTINYINT', 'depth': 'UTINYINT',
+                                       'ts_in_delta': 'INTEGER', 'sequence': 'UINTEGER'})
+WHERE instrument_id = 5482
+----
+2
+
+# ConstantFilter that excludes everything: instrument_id never == 9999.
+# Exercises the "header_filter rejects all" path.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE instrument_id = 9999
+----
+0
+
+# ts_event range filter (ConstantFilter with > operator). Fixture's first row
+# has ts_event = 1609160400098821953 ns; the second row is ~9ms later.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE epoch_ns(ts_event) > 1609160400100000000
+----
+1
+
+# InFilter: instrument_id IN (...) — DuckDB lowers small IN-lists into
+# IN_FILTER (or a chain of constants). The IngestFilter path for IN_FILTER
+# must accept the single matching value.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE instrument_id IN (1, 2, 5482, 9999)
+----
+2
+
+# ConjunctionAndFilter: ConstantFilter AND range filter combined.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE instrument_id = 5482 AND epoch_ns(ts_event) > 1609160400100000000
+----
+1
+
+# OptionalFilter: WHERE col IS NOT NULL. instrument_id is non-nullable in
+# our schema, so this is a tautology — should return all rows. Validates
+# the reinterpret_cast workaround in BuildHeaderFilter doesn't crash.
+query I
+SELECT count(*) FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE instrument_id IS NOT NULL
+----
+2
+
+# Filter + projection together: pushdown machinery handles both
+# simultaneously. Validates the FilterMatches() pre-screen + projected
+# emission interact correctly.
+query R
+SELECT price FROM read_dbn_trades('test/data/test_data.trades.dbn')
+WHERE instrument_id = 5482 AND epoch_ns(ts_event) > 1609160400100000000
+----
+3720.25
+
+# ──────────────────────────────────────────────────────────────────────────
+# ohlcv-1s — Ohlcv layout, no ts_recv. Verifies kHeaderLayoutOhlcv is wired
+# correctly through the filter path.
+# ──────────────────────────────────────────────────────────────────────────
+
+# Filter on instrument_id (logical col 1 under Ohlcv layout, not 2 as Standard).
+# If the layout were misconfigured, the filter would silently misroute and
+# return 0 rows or wrong values.
+query I
+SELECT count(*) FROM read_dbn_ohlcv_1s('test/data/test_data.ohlcv-1s.dbn')
+WHERE instrument_id = 5482
+----
+2
+
+# Same predicate against the CSV — must agree.
+query I
+SELECT count(*) FROM read_csv('test/data/expected/test_data.ohlcv-1s.csv',
+                              header=true,
+                              columns={'ts_event': 'BIGINT', 'instrument_id': 'UINTEGER',
+                                       'publisher_id': 'USMALLINT', 'open': 'DOUBLE',
+                                       'high': 'DOUBLE', 'low': 'DOUBLE', 'close': 'DOUBLE',
+                                       'volume': 'UBIGINT'})
+WHERE instrument_id = 5482
+----
+2
+
+# ──────────────────────────────────────────────────────────────────────────
+# statistics — custom layout {ts_event=0, instrument=3, publisher=4}
+# Verifies the custom-layout filter path.
+# ──────────────────────────────────────────────────────────────────────────
+
+# All 2 statistics rows have instrument_id = 146945.
+query I
+SELECT count(*) FROM read_dbn_statistics('test/data/test_data.statistics.dbn')
+WHERE instrument_id = 146945
+----
+2
+
+# Negative match: instrument_id = some-other-value → 0 rows.
+# Demonstrates the custom-layout filter correctly identifies instrument_id
+# at logical column 3 (not the standard column 2).
+query I
+SELECT count(*) FROM read_dbn_statistics('test/data/test_data.statistics.dbn')
+WHERE instrument_id = 5482
+----
+0
+
+# Publisher-id filter on Statistics — exercises layout's publisher column 4.
+query I
+SELECT count(*) FROM read_dbn_statistics('test/data/test_data.statistics.dbn')
+WHERE publisher_id = 1
+----
+2
+
+# ──────────────────────────────────────────────────────────────────────────
+# mbp-10 — sanity-check pushdown over a large-column schema
+# ──────────────────────────────────────────────────────────────────────────
+
+# Filter + projection on a 72-column schema. Exercises pushdown integration
+# with the high column-count path.
+query I
+SELECT count(*) FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn')
+WHERE instrument_id = 5482
+----
+2
+
+query I
+SELECT count(*) FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn')
+WHERE instrument_id = 5482 AND publisher_id = 1
+----
+2

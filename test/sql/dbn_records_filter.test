@@ -1,0 +1,64 @@
+# name: test/sql/dbn_records_filter.test
+# description: Coverage for dbn_records() under its non-standard layout
+#              kHeaderLayoutRecords {ts_event=0, instrument=4, publisher=3}
+#              and pushdown integration. The standard layout puts instrument
+#              at col 2 and publisher at col 3, so a misconfigured layout
+#              would silently route an instrument_id predicate to the
+#              publisher field.
+# group: [sql]
+
+require dbn
+
+# Baseline: dbn_records over trades fixture has 2 rows.
+query I
+SELECT count(*) FROM dbn_records('test/data/test_data.trades.dbn')
+----
+2
+
+# Filter on instrument_id (col 4 under Records layout). All trades rows have
+# instrument_id=5482; a misconfigured layout (e.g., routing to publisher_id
+# at col 3) would return 0 rows.
+query I
+SELECT count(*) FROM dbn_records('test/data/test_data.trades.dbn')
+WHERE instrument_id = 5482
+----
+2
+
+# Negative match: confirms the filter actually filters (not a no-op).
+query I
+SELECT count(*) FROM dbn_records('test/data/test_data.trades.dbn')
+WHERE instrument_id = 9999
+----
+0
+
+# Filter on publisher_id (col 3 under Records layout).
+query I
+SELECT count(*) FROM dbn_records('test/data/test_data.trades.dbn')
+WHERE publisher_id = 1
+----
+2
+
+# Filter on ts_event (col 0).
+query I
+SELECT count(*) FROM dbn_records('test/data/test_data.trades.dbn')
+WHERE epoch_ns(ts_event) > 1609160400100000000
+----
+1
+
+# Projection without the body BLOB — exercises the BLOB-skip path in the
+# DbnRecordsScan column resolver. (length is in 4-byte units per the DBN
+# wire spec: trades record = 48 bytes = 12 units.)
+query IIII
+SELECT epoch_ns(ts_event), rtype, length, instrument_id
+FROM dbn_records('test/data/test_data.trades.dbn')
+ORDER BY ts_event LIMIT 1
+----
+1609160400098821953	0	12	5482
+
+# Filter + projection together.
+query II
+SELECT instrument_id, length
+FROM dbn_records('test/data/test_data.trades.dbn')
+WHERE publisher_id = 1 AND epoch_ns(ts_event) > 1609160400100000000
+----
+5482	12

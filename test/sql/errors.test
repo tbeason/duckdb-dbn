@@ -1,0 +1,30 @@
+# name: test/sql/errors.test
+# description: Negative-path coverage. Confirms the extension surfaces real
+#              errors for unrecoverable inputs rather than silently misreading.
+# group: [sql]
+
+require dbn
+
+# Missing file — FileSystem::Glob throws IOException through ExpandPaths.
+statement error
+SELECT * FROM read_dbn_trades('test/data/does_not_exist.dbn')
+----
+dbn: no files match
+
+statement error
+SELECT * FROM read_dbn('test/data/does_not_exist.dbn')
+----
+dbn: no files match
+
+# dbn_metadata uses single-file semantics (no glob) — file-not-found surfaces
+# directly from the DbnFileReader constructor.
+statement error
+SELECT * FROM dbn_metadata('test/data/does_not_exist.dbn')
+----
+dbn: failed to open file
+
+# Glob with no matches: same ExpandPaths IOException.
+statement error
+SELECT * FROM read_dbn_trades('test/data/nonexistent_*.dbn')
+----
+dbn: no files match

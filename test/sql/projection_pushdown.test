@@ -1,0 +1,154 @@
+# name: test/sql/projection_pushdown.test
+# description: Verify projection pushdown across each DbnHeaderColumnLayout
+#              variant. Ground truth: post-processed dbn-cli CSVs in
+#              test/data/expected/ (generated via tools/generate_expected.py).
+# group: [sql]
+#
+# Timestamps compared in BIGINT-nanoseconds space — extension emits
+# TIMESTAMP_NS so we apply epoch_ns() on that side; the CSV is raw int64.
+# DuckDB lacks a direct BIGINT → TIMESTAMP_NS cast, so going the other way
+# is the clean path.
+
+require dbn
+
+# ──────────────────────────────────────────────────────────────────────────
+# trades — Standard layout {ts_event=0, instrument=2, publisher=3}
+# Full-row equivalence ext ↔ golden CSV, both directions.
+# ──────────────────────────────────────────────────────────────────────────
+
+query I
+WITH ext AS (SELECT epoch_ns(ts_event) AS ts_event, epoch_ns(ts_recv) AS ts_recv,
+                    instrument_id, publisher_id, price, size,
+                    action, side, flags, depth, ts_in_delta, sequence
+             FROM read_dbn_trades('test/data/test_data.trades.dbn')),
+     ref AS (SELECT *
+             FROM read_csv('test/data/expected/test_data.trades.csv',
+                           header=true,
+                           columns={'ts_event': 'BIGINT', 'ts_recv': 'BIGINT',
+                                    'instrument_id': 'UINTEGER', 'publisher_id': 'USMALLINT',
+                                    'price': 'DOUBLE', 'size': 'UINTEGER',
+                                    'action': 'VARCHAR', 'side': 'VARCHAR',
+                                    'flags': 'UTINYINT', 'depth': 'UTINYINT',
+                                    'ts_in_delta': 'INTEGER', 'sequence': 'UINTEGER'}))
+SELECT count(*) FROM ((TABLE ext EXCEPT TABLE ref) UNION ALL (TABLE ref EXCEPT TABLE ext))
+----
+0
+
+# Single-column projection — slot 0 resolves price (column_id 4).
+query R
+SELECT price FROM read_dbn_trades('test/data/test_data.trades.dbn') ORDER BY 1
+----
+3720.25
+3720.25
+
+# Two-column projection in reverse logical order. Resolves price (col_id 4)
+# to slot 0 and ts_event (col_id 0) to slot 1.
+query I
+SELECT count(*) FROM (
+  (SELECT price, epoch_ns(ts_event) FROM read_dbn_trades('test/data/test_data.trades.dbn'))
+  EXCEPT
+  (SELECT price, ts_event
+   FROM read_csv('test/data/expected/test_data.trades.csv',
+                 header=true,
+                 columns={'ts_event': 'BIGINT', 'ts_recv': 'BIGINT',
+                          'instrument_id': 'UINTEGER', 'publisher_id': 'USMALLINT',
+                          'price': 'DOUBLE', 'size': 'UINTEGER',
+                          'action': 'VARCHAR', 'side': 'VARCHAR',
+                          'flags': 'UTINYINT', 'depth': 'UTINYINT',
+                          'ts_in_delta': 'INTEGER', 'sequence': 'UINTEGER'}))
+)
+----
+0
+
+# Three-column projection skipping middle columns — verifies "unused slot"
+# default branch in the per-row switch never fires for projected slots.
+query I
+SELECT count(*) FROM (
+  (SELECT sequence, action, epoch_ns(ts_event) FROM read_dbn_trades('test/data/test_data.trades.dbn'))
+  EXCEPT
+  (SELECT sequence, action, ts_event
+   FROM read_csv('test/data/expected/test_data.trades.csv',
+                 header=true,
+                 columns={'ts_event': 'BIGINT', 'ts_recv': 'BIGINT',
+                          'instrument_id': 'UINTEGER', 'publisher_id': 'USMALLINT',
+                          'price': 'DOUBLE', 'size': 'UINTEGER',
+                          'action': 'VARCHAR', 'side': 'VARCHAR',
+                          'flags': 'UTINYINT', 'depth': 'UTINYINT',
+                          'ts_in_delta': 'INTEGER', 'sequence': 'UINTEGER'}))
+)
+----
+0
+
+# ──────────────────────────────────────────────────────────────────────────
+# mbp-10 — 12 base + 60 level cols, max projection complexity.
+# ──────────────────────────────────────────────────────────────────────────
+
+# Project a scattered subset across the 72-column layout: base + 2 levels.
+# Forces the projection resolver to span column_ids {2, 7, 12, 17, 42}.
+query I
+SELECT count(*) FROM (
+  (SELECT instrument_id, side, bid_px_00, ask_px_00, bid_px_05
+   FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn'))
+  EXCEPT
+  (SELECT instrument_id::UINTEGER, side::VARCHAR, bid_px_00::DOUBLE, ask_px_00::DOUBLE, bid_px_05::DOUBLE
+   FROM read_csv('test/data/expected/test_data.mbp-10.csv', auto_detect=true))
+)
+----
+0
+
+# ──────────────────────────────────────────────────────────────────────────
+# ohlcv-1s — Ohlcv layout {ts_event=0, instrument=1, publisher=2}, NO ts_recv
+# Verifies the kHeaderLayoutOhlcv path through DbnHeaderColumnLayout.
+# ──────────────────────────────────────────────────────────────────────────
+
+query I
+WITH ext AS (SELECT epoch_ns(ts_event) AS ts_event, instrument_id, publisher_id,
+                    open, high, low, close, volume
+             FROM read_dbn_ohlcv_1s('test/data/test_data.ohlcv-1s.dbn')),
+     ref AS (SELECT *
+             FROM read_csv('test/data/expected/test_data.ohlcv-1s.csv',
+                           header=true,
+                           columns={'ts_event': 'BIGINT', 'instrument_id': 'UINTEGER',
+                                    'publisher_id': 'USMALLINT', 'open': 'DOUBLE',
+                                    'high': 'DOUBLE', 'low': 'DOUBLE', 'close': 'DOUBLE',
+                                    'volume': 'UBIGINT'}))
+SELECT count(*) FROM ((TABLE ext EXCEPT TABLE ref) UNION ALL (TABLE ref EXCEPT TABLE ext))
+----
+0
+
+# Skip ts_event/instrument/publisher entirely — project only OHLC values.
+query I
+SELECT count(*) FROM (
+  (SELECT open, high, low, close FROM read_dbn_ohlcv_1s('test/data/test_data.ohlcv-1s.dbn'))
+  EXCEPT
+  (SELECT open::DOUBLE, high::DOUBLE, low::DOUBLE, close::DOUBLE
+   FROM read_csv('test/data/expected/test_data.ohlcv-1s.csv', auto_detect=true))
+)
+----
+0
+
+# ──────────────────────────────────────────────────────────────────────────
+# statistics — custom layout {ts_event=0, instrument=3, publisher=4}
+# Verifies the in-bind DbnHeaderColumnLayout{0, 3, 4} assignment.
+# ──────────────────────────────────────────────────────────────────────────
+
+# Project instrument_id + publisher_id at their non-standard logical indices.
+# If the layout were misconfigured, these would silently return wrong values.
+query II
+SELECT instrument_id, publisher_id
+FROM read_dbn_statistics('test/data/test_data.statistics.dbn') LIMIT 1
+----
+146945	1
+
+# ──────────────────────────────────────────────────────────────────────────
+# definition — 76 cols, version-aware v1 → v3 column upgrade
+# ──────────────────────────────────────────────────────────────────────────
+
+# Projection over a tiny subset of the largest schema.
+query TII
+SELECT raw_symbol, instrument_id, publisher_id
+FROM read_dbn_definition('test/data/test_data.definition.dbn')
+ORDER BY instrument_id
+LIMIT 1
+----
+MSFT	6819	2

@@ -1,0 +1,216 @@
+# name: test/sql/polymorphic_equivalence.test
+# description: For every fixture, assert that polymorphic read_dbn(path)
+#              returns exactly the same rows as the schema-specific
+#              read_dbn_<schema>(path). This is the only blanket-coverage
+#              test of the per-schema header_layout switch added in
+#              Phase 5-A stage 2 (the switch in ReadDbnBind that dispatches
+#              kHeaderLayoutOhlcv / Statistics / Standard based on
+#              md.schema). If any schema's polymorphic dispatch is wrong,
+#              its EXCEPT here will surface non-zero.
+# group: [sql]
+
+require dbn
+
+# ──────────────────────────────────────────────────────────────────────────
+# Standard-layout schemas (most)
+# ──────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_trades('test/data/test_data.trades.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.trades.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.trades.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_trades('test/data/test_data.trades.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_mbo('test/data/test_data.mbo.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.mbo.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.mbo.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_mbo('test/data/test_data.mbo.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_mbp1('test/data/test_data.mbp-1.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.mbp-1.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.mbp-1.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_mbp1('test/data/test_data.mbp-1.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.mbp-10.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.mbp-10.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_mbp10('test/data/test_data.mbp-10.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_bbo_1s('test/data/test_data.bbo-1s.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.bbo-1s.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.bbo-1s.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_bbo_1s('test/data/test_data.bbo-1s.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_bbo_1m('test/data/test_data.bbo-1m.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.bbo-1m.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.bbo-1m.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_bbo_1m('test/data/test_data.bbo-1m.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_cbbo_1s('test/data/test_data.cbbo-1s.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.cbbo-1s.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.cbbo-1s.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_cbbo_1s('test/data/test_data.cbbo-1s.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_cmbp1('test/data/test_data.cmbp-1.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.cmbp-1.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.cmbp-1.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_cmbp1('test/data/test_data.cmbp-1.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_tbbo('test/data/test_data.tbbo.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.tbbo.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.tbbo.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_tbbo('test/data/test_data.tbbo.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_status('test/data/test_data.status.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.status.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.status.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_status('test/data/test_data.status.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_imbalance('test/data/test_data.imbalance.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.imbalance.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.imbalance.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_imbalance('test/data/test_data.imbalance.dbn'))
+)
+----
+0
+
+# ──────────────────────────────────────────────────────────────────────────
+# Ohlcv layout — every OHLCV resolution must hit the kHeaderLayoutOhlcv case
+# in ReadDbnBind's switch.
+# ──────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_ohlcv_1s('test/data/test_data.ohlcv-1s.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.ohlcv-1s.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.ohlcv-1s.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_ohlcv_1s('test/data/test_data.ohlcv-1s.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_ohlcv_1m('test/data/test_data.ohlcv-1m.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.ohlcv-1m.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.ohlcv-1m.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_ohlcv_1m('test/data/test_data.ohlcv-1m.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_ohlcv_1h('test/data/test_data.ohlcv-1h.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.ohlcv-1h.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.ohlcv-1h.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_ohlcv_1h('test/data/test_data.ohlcv-1h.dbn'))
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_ohlcv_1d('test/data/test_data.ohlcv-1d.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.ohlcv-1d.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.ohlcv-1d.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_ohlcv_1d('test/data/test_data.ohlcv-1d.dbn'))
+)
+----
+0
+
+# ──────────────────────────────────────────────────────────────────────────
+# Statistics — custom layout {0, 3, 4} via the explicit case in ReadDbnBind
+# ──────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_statistics('test/data/test_data.statistics.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.statistics.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.statistics.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_statistics('test/data/test_data.statistics.dbn'))
+)
+----
+0
+
+# ──────────────────────────────────────────────────────────────────────────
+# Definition — 76-column schema, also Standard layout
+# ──────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_dbn_definition('test/data/test_data.definition.dbn'))
+  EXCEPT (SELECT * FROM read_dbn('test/data/test_data.definition.dbn'))
+  UNION ALL
+  (SELECT * FROM read_dbn('test/data/test_data.definition.dbn'))
+  EXCEPT (SELECT * FROM read_dbn_definition('test/data/test_data.definition.dbn'))
+)
+----
+0
