@@ -88,12 +88,16 @@ public:
 	template <typename T>
 	bool NextAs(T &out, databento::RType expected_rtype) {
 		static_assert(sizeof(T) <= kMaxRecordLen, "record type larger than reader buffer");
-		alignas(8) std::byte buf[kMaxRecordLen];
 		databento::RecordHeader hdr {};
 		std::size_t rec_len = 0;
-		while (NextRecordRaw(buf, &hdr, &rec_len, nullptr)) {
+		// Zero-copy: NextRecordView hands back a pointer into the reader's block
+		// buffer (refilled in large chunks), so the hot path makes neither a
+		// per-record input read nor a body copy — just the single memcpy into the
+		// caller's typed struct below.
+		const std::byte *p;
+		while ((p = NextRecordView(&hdr, &rec_len)) != nullptr) {
 			if (track_symbols_ && hdr.rtype == databento::RType::SymbolMapping) {
-				ObserveSymbolMapping(hdr, buf, rec_len);
+				ObserveSymbolMapping(hdr, p, rec_len);
 			}
 			if (hdr.rtype != expected_rtype) {
 				continue;
@@ -105,7 +109,7 @@ public:
 				                         "C++ struct is the v3 layout (e.g. InstrumentDefMsg, StatMsg). "
 				                         "Version-aware decoding is a future-phase item.");
 			}
-			std::memcpy(&out, buf, sizeof(T));
+			std::memcpy(&out, p, sizeof(T));
 			return true;
 		}
 		return false;
@@ -118,12 +122,27 @@ private:
 	// its instrument_id → stype_out_symbol binding. No-op on malformed length.
 	void ObserveSymbolMapping(const databento::RecordHeader &hdr, const std::byte *buf, std::size_t len);
 
+	// Block-buffered record reader. NextRecordView returns a pointer to the next
+	// record's contiguous bytes inside read_buf_ (valid until the next call),
+	// having consumed record + any ts_out trailer. EnsureBytes guarantees `n`
+	// contiguous bytes from buf_pos_, compacting and refilling from input_ in
+	// large reads — so per-record input reads collapse to ~one per block.
+	const std::byte *NextRecordView(databento::RecordHeader *hdr, std::size_t *record_len_bytes);
+	bool EnsureBytes(std::size_t n);
+
+	static constexpr std::size_t kReadBufSize = 1u << 20; // 1 MiB block buffer
+
 	std::unique_ptr<IDbnInput> input_;
 	DbnMetadata metadata_;       // current file's metadata
 	DbnMetadata first_metadata_; // first file's metadata (for GetMetadata)
 	std::vector<std::string> remaining_paths_;
 	std::string current_path_;
 	bool first_opened_ = false;
+
+	// Block buffer for NextRecordView. Records are served from [buf_pos_, buf_len_).
+	std::vector<std::byte> read_buf_;
+	std::size_t buf_pos_ = 0;
+	std::size_t buf_len_ = 0;
 
 	// Symbol tracking (off unless EnableSymbolTracking() called). symbol_pool_
 	// owns the strings with stable addresses (std::deque never relocates

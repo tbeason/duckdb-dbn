@@ -232,21 +232,54 @@ bool DbnFileReader::AdvanceToNextFile() {
 	return true;
 }
 
-bool DbnFileReader::NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
-                                  std::uint64_t *ts_out_out) {
-	while (input_) {
-		const auto got = input_->Read(reinterpret_cast<char *>(buf), sizeof(databento::RecordHeader));
+bool DbnFileReader::EnsureBytes(std::size_t n) {
+	std::size_t remaining = buf_len_ - buf_pos_;
+	if (remaining >= n) {
+		return true;
+	}
+	// Compact the unconsumed tail to the front so the read below is contiguous.
+	if (buf_pos_ != 0) {
+		if (remaining != 0) {
+			std::memmove(read_buf_.data(), read_buf_.data() + buf_pos_, remaining);
+		}
+		buf_pos_ = 0;
+		buf_len_ = remaining;
+	}
+	// Size the buffer to the block size (or larger if a single record exceeds
+	// it — can't happen for valid DBN, but keeps EnsureBytes self-contained).
+	const std::size_t want = (n > kReadBufSize) ? n : kReadBufSize;
+	if (read_buf_.size() < want) {
+		read_buf_.resize(want);
+	}
+	// One large read per refill instead of one per record. For ZstdInput this
+	// drives ZSTD_decompressStream with a ~1 MiB output buffer rather than 16 B.
+	// input_ is null once the last file is exhausted (AdvanceToNextFile resets
+	// it) — guard so a post-EOF call returns "no bytes" instead of dereferencing.
+	while (input_ && buf_len_ < n) {
+		const std::size_t space = read_buf_.size() - buf_len_;
+		const std::size_t got = input_->Read(reinterpret_cast<char *>(read_buf_.data()) + buf_len_, space);
 		if (got == 0) {
+			break; // EOF on the current input
+		}
+		buf_len_ += got;
+	}
+	return (buf_len_ - buf_pos_) >= n;
+}
+
+const std::byte *DbnFileReader::NextRecordView(databento::RecordHeader *hdr, std::size_t *record_len_bytes) {
+	for (;;) {
+		if (!EnsureBytes(sizeof(databento::RecordHeader))) {
+			// A clean file boundary leaves zero unconsumed bytes; anything else is
+			// a truncated trailing record.
+			if (buf_len_ - buf_pos_ != 0) {
+				throw std::runtime_error("dbn: truncated record header in file: " + current_path_);
+			}
 			if (!AdvanceToNextFile()) {
-				return false;
+				return nullptr;
 			}
 			continue;
 		}
-		if (got != sizeof(databento::RecordHeader)) {
-			throw std::runtime_error("dbn: truncated record header in file: " + current_path_);
-		}
-
-		std::memcpy(hdr, buf, sizeof(databento::RecordHeader));
+		std::memcpy(hdr, read_buf_.data() + buf_pos_, sizeof(databento::RecordHeader));
 
 		const std::size_t record_bytes = static_cast<std::size_t>(hdr->length) * kRecordHeaderLengthMultiplier;
 		if (record_bytes < sizeof(databento::RecordHeader)) {
@@ -257,27 +290,39 @@ bool DbnFileReader::NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, 
 			                         " bytes) in: " + current_path_);
 		}
 
-		const std::size_t remaining = record_bytes - sizeof(databento::RecordHeader);
-		if (remaining > 0) {
-			ReadExact(*input_, reinterpret_cast<char *>(buf) + sizeof(databento::RecordHeader), remaining,
-			          "record body");
+		// Pull the whole record plus any ts_out trailer into the buffer so the
+		// returned view is contiguous and the trailer is consumed atomically.
+		const std::size_t total = record_bytes + (metadata_.ts_out ? sizeof(std::uint64_t) : 0);
+		if (!EnsureBytes(total)) {
+			throw std::runtime_error("dbn: short read while reading record body in: " + current_path_);
 		}
-
+		// Re-fetch the pointer: EnsureBytes(total) may have compacted/reallocated.
+		const std::byte *p = read_buf_.data() + buf_pos_;
+		buf_pos_ += total;
 		if (record_len_bytes) {
 			*record_len_bytes = record_bytes;
 		}
-
-		if (metadata_.ts_out) {
-			std::uint64_t trailer = 0;
-			ReadExact(*input_, &trailer, sizeof(trailer), "ts_out trailer");
-			if (ts_out_out) {
-				*ts_out_out = trailer;
-			}
-		}
-
-		return true;
+		return p;
 	}
-	return false;
+}
+
+bool DbnFileReader::NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
+                                  std::uint64_t *ts_out_out) {
+	std::size_t rec_len = 0;
+	const std::byte *p = NextRecordView(hdr, &rec_len);
+	if (!p) {
+		return false;
+	}
+	std::memcpy(buf, p, rec_len);
+	if (record_len_bytes) {
+		*record_len_bytes = rec_len;
+	}
+	// The trailer sits at p[rec_len..); NextRecordView already consumed it, but
+	// the bytes remain valid in the buffer until the next view call.
+	if (ts_out_out && metadata_.ts_out) {
+		std::memcpy(ts_out_out, p + rec_len, sizeof(std::uint64_t));
+	}
+	return true;
 }
 
 void DbnFileReader::ObserveSymbolMapping(const databento::RecordHeader &hdr, const std::byte *buf,
