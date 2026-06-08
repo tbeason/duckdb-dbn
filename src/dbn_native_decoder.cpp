@@ -7,6 +7,9 @@
 #include <stdexcept>
 #include <vector>
 
+#include "databento/v1.hpp"
+#include "databento/v2.hpp"
+
 #define ZSTD_STATIC_LINKING_ONLY 1
 #include <zstd.h>
 
@@ -275,6 +278,44 @@ bool DbnFileReader::NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, 
 		return true;
 	}
 	return false;
+}
+
+void DbnFileReader::ObserveSymbolMapping(const databento::RecordHeader &hdr, const std::byte *buf,
+                                         std::size_t len) {
+	// Pull stype_out_symbol — the output-symbology symbol bound to this
+	// instrument_id (the human-readable symbol, e.g. the OSI option symbol on
+	// OPRA). v2/v3 share the canonical 176-byte SymbolMappingMsg; v1 is the
+	// 80-byte legacy layout. memcpy into a local to dodge alignment/aliasing.
+	const char *sym = nullptr;
+	std::size_t cap = 0;
+	databento::SymbolMappingMsg v2 {};
+	databento::v1::SymbolMappingMsg v1 {};
+	if (first_metadata_.version >= 2 && len == sizeof(v2)) {
+		std::memcpy(&v2, buf, sizeof(v2));
+		sym = v2.stype_out_symbol.data();
+		cap = v2.stype_out_symbol.size();
+	} else if (len == sizeof(v1)) {
+		std::memcpy(&v1, buf, sizeof(v1));
+		sym = v1.stype_out_symbol.data();
+		cap = v1.stype_out_symbol.size();
+	} else {
+		return; // unrecognized length — leave the map untouched
+	}
+
+	std::size_t n = 0;
+	while (n < cap && sym[n] != '\0') {
+		++n;
+	}
+
+	// Skip the update if the binding is unchanged — keeps symbol_pool_ from
+	// growing on the (common) repeated-snapshot case.
+	auto it = live_symbols_.find(hdr.instrument_id);
+	if (it != live_symbols_.end() && it->second->size() == n &&
+	    std::memcmp(it->second->data(), sym, n) == 0) {
+		return;
+	}
+	symbol_pool_.emplace_back(sym, n);
+	live_symbols_[hdr.instrument_id] = &symbol_pool_.back();
 }
 
 } // namespace duckdb_dbn

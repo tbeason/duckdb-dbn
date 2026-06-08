@@ -3,10 +3,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "databento/enums.hpp"
@@ -65,6 +67,24 @@ public:
 	bool NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
 	                   std::uint64_t *ts_out_out);
 
+	// Symbol resolution for live captures. When enabled, the reader watches the
+	// SymbolMappingMsg records it would otherwise skip (they're a different
+	// rtype than any market-data reader's target) and maintains a live
+	// instrument_id → output-symbol map. Because mappings always precede the
+	// records they describe in the stream, CurrentSymbol() is correct as of the
+	// most recently returned record — i.e. stream order *is* the validity
+	// window. No second pass over the file, and record order is untouched.
+	void EnableSymbolTracking() {
+		track_symbols_ = true;
+	}
+	// Returns the active output symbol for `instrument_id` as of the records
+	// consumed so far, or nullptr if no mapping has been seen yet. The pointed-to
+	// string is stable for the reader's lifetime (backed by symbol_pool_).
+	const std::string *CurrentSymbol(std::uint32_t instrument_id) const {
+		auto it = live_symbols_.find(instrument_id);
+		return it == live_symbols_.end() ? nullptr : it->second;
+	}
+
 	template <typename T>
 	bool NextAs(T &out, databento::RType expected_rtype) {
 		static_assert(sizeof(T) <= kMaxRecordLen, "record type larger than reader buffer");
@@ -72,6 +92,9 @@ public:
 		databento::RecordHeader hdr {};
 		std::size_t rec_len = 0;
 		while (NextRecordRaw(buf, &hdr, &rec_len, nullptr)) {
+			if (track_symbols_ && hdr.rtype == databento::RType::SymbolMapping) {
+				ObserveSymbolMapping(hdr, buf, rec_len);
+			}
 			if (hdr.rtype != expected_rtype) {
 				continue;
 			}
@@ -91,6 +114,9 @@ public:
 private:
 	void OpenAndParseFile(const std::string &path);
 	bool AdvanceToNextFile();
+	// Decode a SymbolMappingMsg (version-aware) and update live_symbols_ with
+	// its instrument_id → stype_out_symbol binding. No-op on malformed length.
+	void ObserveSymbolMapping(const databento::RecordHeader &hdr, const std::byte *buf, std::size_t len);
 
 	std::unique_ptr<IDbnInput> input_;
 	DbnMetadata metadata_;       // current file's metadata
@@ -98,6 +124,16 @@ private:
 	std::vector<std::string> remaining_paths_;
 	std::string current_path_;
 	bool first_opened_ = false;
+
+	// Symbol tracking (off unless EnableSymbolTracking() called). symbol_pool_
+	// owns the strings with stable addresses (std::deque never relocates
+	// existing elements on push_back), so the pointers handed out by
+	// CurrentSymbol() — and snapshotted per-row by the scans — stay valid even
+	// as later mappings arrive. A remap of an id appends a *new* pool entry and
+	// repoints the map, leaving earlier snapshots untouched.
+	bool track_symbols_ = false;
+	std::deque<std::string> symbol_pool_;
+	std::unordered_map<std::uint32_t, const std::string *> live_symbols_;
 };
 
 } // namespace duckdb_dbn

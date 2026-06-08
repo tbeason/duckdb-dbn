@@ -422,6 +422,11 @@ struct ReadDbnBindData : public TableFunctionData {
 	// when the user passed a glob pattern.
 	std::vector<std::string> file_paths;
 	DbnHeaderColumnLayout header_layout = kHeaderLayoutStandard;
+	// Set by the RegisterWithSymbols bind wrapper when the user passed
+	// symbols := true. The resolved-symbol column is appended last, so its
+	// logical column id equals the base column count.
+	bool with_symbols = false;
+	idx_t symbol_col_id = 0;
 };
 
 struct ReadDbnGlobalState : public GlobalTableFunctionState {
@@ -450,6 +455,24 @@ struct ReadDbnGlobalState : public GlobalTableFunctionState {
 	// `body_filter_built` distinguishes "not yet built" from "built, no-op".
 	unique_ptr<Expression> body_filter_expr;
 	bool body_filter_built = false;
+
+	// Symbol resolution (symbols := true). When set, each scan snapshots the
+	// active output symbol for every emitted row into sym_scratch[row], and the
+	// ScanWithBodyFilter wrapper materializes the `symbol` VARCHAR column from
+	// it. nullptr entries → SQL NULL (no mapping seen for that instrument yet).
+	// Resolution is single-threaded (these scans declare no parallel state), so
+	// a plain per-global-state scratch buffer is safe.
+	bool with_symbols = false;
+	idx_t symbol_col_id = 0;
+	std::array<const std::string *, STANDARD_VECTOR_SIZE> sym_scratch {};
+
+	// Snapshot the current symbol for `instr` into row slot `n`. Called once per
+	// emitted row by the per-schema scans (no-op unless symbols are tracked).
+	inline void NoteSymbol(idx_t n, uint32_t instr) {
+		if (with_symbols) {
+			sym_scratch[n] = reader->CurrentSymbol(instr);
+		}
+	}
 };
 
 static unique_ptr<GlobalTableFunctionState>
@@ -458,8 +481,14 @@ ReadDbnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
 	std::vector<column_t> col_ids = input.column_ids;
 	auto hf = BuildHeaderFilter(input.filters, col_ids, bd.header_layout);
 	auto filters_copy = input.filters ? input.filters->Copy() : nullptr;
-	return make_uniq<ReadDbnGlobalState>(bd.file_paths, std::move(col_ids),
-	                                     std::move(hf), std::move(filters_copy));
+	auto gs = make_uniq<ReadDbnGlobalState>(bd.file_paths, std::move(col_ids),
+	                                        std::move(hf), std::move(filters_copy));
+	if (bd.with_symbols) {
+		gs->with_symbols = true;
+		gs->symbol_col_id = bd.symbol_col_id;
+		gs->reader->EnableSymbolTracking();
+	}
+	return std::move(gs);
 }
 
 
@@ -575,6 +604,7 @@ static void TradesScan(ClientContext &, TableFunctionInput &input, DataChunk &ou
 		if (!st.header_filter.Matches(rec.hd)) {
 			continue;
 		}
+		st.NoteSymbol(n, rec.hd.instrument_id);
 		for (idx_t i = 0; i < projected_count; ++i) {
 			const auto cid = col_ids[i];
 			switch (cid) {
@@ -693,6 +723,7 @@ static void MboScan(ClientContext &, TableFunctionInput &input, DataChunk &out) 
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Mbo)) {
 		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		st.NoteSymbol(n, rec.hd.instrument_id);
 		for (idx_t i = 0; i < projected_count; ++i) {
 			const auto cid = col_ids[i];
 			switch (cid) {
@@ -787,6 +818,7 @@ static void Mbp1ScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
 		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		st.NoteSymbol(n, rec.hd.instrument_id);
 		const auto &L = rec.levels[0];
 		for (idx_t i = 0; i < projected_count; ++i) {
 			const auto cid = col_ids[i];
@@ -883,14 +915,16 @@ static void Mbp10Scan(ClientContext &, TableFunctionInput &input, DataChunk &out
 	static constexpr column_t COL_LEVELS_BASE = 12;
 	static constexpr column_t COL_LEVELS_END  = COL_LEVELS_BASE + 60;
 
-	std::array<int64_t *,   72> p_i64  {};
-	std::array<uint32_t *,  72> p_u32  {};
-	std::array<uint16_t *,  72> p_u16  {};
-	std::array<double *,    72> p_dbl  {};
-	std::array<string_t *,  72> p_str  {};
-	std::array<uint8_t *,   72> p_u8   {};
-	std::array<int32_t *,   72> p_i32  {};
-	D_ASSERT(projected_count <= 72);
+	// 72 base columns (12 header/trade + 60 across 10 book levels); +1 headroom
+	// for the optional appended `symbol` column when symbols := true.
+	std::array<int64_t *,   73> p_i64  {};
+	std::array<uint32_t *,  73> p_u32  {};
+	std::array<uint16_t *,  73> p_u16  {};
+	std::array<double *,    73> p_dbl  {};
+	std::array<string_t *,  73> p_str  {};
+	std::array<uint8_t *,   73> p_u8   {};
+	std::array<int32_t *,   73> p_i32  {};
+	D_ASSERT(projected_count <= 73);
 
 	for (idx_t i = 0; i < projected_count; ++i) {
 		const auto cid = col_ids[i];
@@ -932,6 +966,7 @@ static void Mbp10Scan(ClientContext &, TableFunctionInput &input, DataChunk &out
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Mbp10)) {
 		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		st.NoteSymbol(n, rec.hd.instrument_id);
 		for (idx_t i = 0; i < projected_count; ++i) {
 			const auto cid = col_ids[i];
 			switch (cid) {
@@ -1039,6 +1074,7 @@ static void BboScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &o
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
 		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		st.NoteSymbol(n, rec.hd.instrument_id);
 		const auto &L = rec.levels[0];
 		for (idx_t i = 0; i < projected_count; ++i) {
 			const auto cid = col_ids[i];
@@ -1139,6 +1175,7 @@ static void CbboScanImpl(ClientContext &, TableFunctionInput &input, DataChunk &
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
 		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		st.NoteSymbol(n, rec.hd.instrument_id);
 		const auto &L = rec.levels[0];
 		for (idx_t i = 0; i < projected_count; ++i) {
 			const auto cid = col_ids[i];
@@ -1207,14 +1244,16 @@ static void Cmbp1ScanImpl(ClientContext &, TableFunctionInput &input, DataChunk 
 		COL_BID_SZ = 12,   COL_ASK_SZ = 13,  COL_BID_PB = 14,  COL_ASK_PB = 15,
 	};
 
-	std::array<int64_t *,   16> p_i64  {};
-	std::array<uint32_t *,  16> p_u32  {};
-	std::array<uint16_t *,  16> p_u16  {};
-	std::array<double *,    16> p_dbl  {};
-	std::array<string_t *,  16> p_str  {};
-	std::array<uint8_t *,   16> p_u8   {};
-	std::array<int32_t *,   16> p_i32  {};
-	D_ASSERT(projected_count <= 16);
+	// 16 base columns; +1 headroom for the optional appended `symbol` column
+	// when symbols := true (tcbbo/cmbp1 both bind exactly 16 base columns).
+	std::array<int64_t *,   17> p_i64  {};
+	std::array<uint32_t *,  17> p_u32  {};
+	std::array<uint16_t *,  17> p_u16  {};
+	std::array<double *,    17> p_dbl  {};
+	std::array<string_t *,  17> p_str  {};
+	std::array<uint8_t *,   17> p_u8   {};
+	std::array<int32_t *,   17> p_i32  {};
+	D_ASSERT(projected_count <= 17);
 
 	for (idx_t i = 0; i < projected_count; ++i) {
 		const auto cid = col_ids[i];
@@ -1244,6 +1283,7 @@ static void Cmbp1ScanImpl(ClientContext &, TableFunctionInput &input, DataChunk 
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
 		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		st.NoteSymbol(n, rec.hd.instrument_id);
 		const auto &L = rec.levels[0];
 		for (idx_t i = 0; i < projected_count; ++i) {
 			const auto cid = col_ids[i];
@@ -1334,6 +1374,7 @@ static void OhlcvScanImpl(ClientContext &, TableFunctionInput &input, DataChunk 
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, rtype)) {
 		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		st.NoteSymbol(n, rec.hd.instrument_id);
 		for (idx_t i = 0; i < projected_count; ++i) {
 			const auto cid = col_ids[i];
 			switch (cid) {
@@ -1428,6 +1469,7 @@ static void StatusScan(ClientContext &, TableFunctionInput &input, DataChunk &ou
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Status)) {
 		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		st.NoteSymbol(n, rec.hd.instrument_id);
 		for (idx_t i = 0; i < projected_count; ++i) {
 			const auto cid = col_ids[i];
 			switch (cid) {
@@ -1550,6 +1592,7 @@ static void ImbalanceScan(ClientContext &, TableFunctionInput &input, DataChunk 
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Imbalance)) {
 		if (!st.header_filter.Matches(rec.hd)) { continue; }
+		st.NoteSymbol(n, rec.hd.instrument_id);
 		for (idx_t i = 0; i < projected_count; ++i) {
 			const auto cid = col_ids[i];
 			switch (cid) {
@@ -1667,6 +1710,7 @@ static void StatisticsScan(ClientContext &, TableFunctionInput &input, DataChunk
 		databento::v1::StatMsg rec {};
 		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Statistics)) {
 			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			st.NoteSymbol(n, rec.hd.instrument_id);
 			for (idx_t i = 0; i < projected_count; ++i) {
 				const auto cid = col_ids[i];
 				switch (cid) {
@@ -1698,6 +1742,7 @@ static void StatisticsScan(ClientContext &, TableFunctionInput &input, DataChunk
 		databento::StatMsg rec {};
 		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::Statistics)) {
 			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			st.NoteSymbol(n, rec.hd.instrument_id);
 			for (idx_t i = 0; i < projected_count; ++i) {
 				const auto cid = col_ids[i];
 				switch (cid) {
@@ -1820,6 +1865,7 @@ static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk
 		databento::InstrumentDefMsg rec {};
 		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::InstrumentDef)) {
 			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			st.NoteSymbol(n, rec.hd.instrument_id);
 			for (idx_t i = 0; i < projected_count; ++i) {
 				const auto cid = col_ids[i];
 				switch (cid) {
@@ -1909,6 +1955,7 @@ static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk
 		databento::v2::InstrumentDefMsg rec {};
 		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::InstrumentDef)) {
 			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			st.NoteSymbol(n, rec.hd.instrument_id);
 			for (idx_t i = 0; i < projected_count; ++i) {
 				const auto cid = col_ids[i];
 				switch (cid) {
@@ -1998,6 +2045,7 @@ static void DefinitionScan(ClientContext &, TableFunctionInput &input, DataChunk
 		databento::v1::InstrumentDefMsg rec {};
 		while (n < STANDARD_VECTOR_SIZE && st.reader->NextAs(rec, databento::RType::InstrumentDef)) {
 			if (!st.header_filter.Matches(rec.hd)) { continue; }
+			st.NoteSymbol(n, rec.hd.instrument_id);
 			for (idx_t i = 0; i < projected_count; ++i) {
 				const auto cid = col_ids[i];
 				switch (cid) {
@@ -2720,13 +2768,52 @@ static unique_ptr<TableRef> ReadDbnReplacement(ClientContext &, ReplacementScanI
 // ExpressionExecutor. With this in place, filter_pushdown=true is safe —
 // header filters get the per-record early-skip fast path and body filters
 // still take effect (no silent drop).
+// Materialize the appended `symbol` column from the per-row snapshots the scan
+// stashed in sym_scratch. No-op when the column was projected away. Must run
+// after the inner scan (which fills sym_scratch) and before the body-filter
+// pass (so `WHERE symbol = '…'` sees populated values). Rows whose snapshot is
+// null — no mapping seen for that instrument — emit SQL NULL.
+static void FillSymbolColumn(ReadDbnGlobalState &st, DataChunk &out) {
+	idx_t slot = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < st.column_ids.size(); ++i) {
+		if (st.column_ids[i] == st.symbol_col_id) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot == DConstants::INVALID_INDEX) {
+		return; // symbol column not projected
+	}
+	auto &vec = out.data[slot];
+	auto data = FlatVector::GetData<string_t>(vec);
+	auto &validity = FlatVector::Validity(vec);
+	const idx_t count = out.size();
+	for (idx_t n = 0; n < count; ++n) {
+		const std::string *s = st.sym_scratch[n];
+		if (s) {
+			data[n] = StringVector::AddString(vec, *s);
+		} else {
+			validity.SetInvalid(n);
+		}
+	}
+}
+
 template <table_function_t Inner>
 static void ScanWithBodyFilter(ClientContext &c, TableFunctionInput &input, DataChunk &out) {
+	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
+	// Reset per-chunk snapshots so a row the inner scan fails to annotate
+	// degrades to SQL NULL rather than reusing a stale pointer from the
+	// previous chunk.
+	if (st.with_symbols) {
+		st.sym_scratch.fill(nullptr);
+	}
 	Inner(c, input, out);
 	if (out.size() == 0) {
 		return;
 	}
-	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
+	if (st.with_symbols) {
+		FillSymbolColumn(st, out);
+	}
 	if (!st.filters) {
 		return;
 	}
@@ -2752,28 +2839,62 @@ static void Register(ExtensionLoader &loader, const char *name,
 	loader.RegisterFunction(f);
 }
 
+// Bind wrapper that adds opt-in symbol resolution to a market-data reader.
+// Delegates to the schema's own bind, then — if symbols := true — appends a
+// `symbol` VARCHAR column and records the flag on the bind data. Keeps the
+// per-schema binds untouched.
+template <table_function_bind_t Bind>
+static unique_ptr<FunctionData> BindWithSymbols(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<string> &names) {
+	auto fd = Bind(context, input, return_types, names);
+	auto entry = input.named_parameters.find("symbols");
+	if (entry != input.named_parameters.end() && !entry->second.IsNull() &&
+	    BooleanValue::Get(entry->second)) {
+		auto &bd = fd->Cast<ReadDbnBindData>();
+		bd.with_symbols = true;
+		bd.symbol_col_id = names.size(); // appended last → id == prior column count
+		names.emplace_back("symbol");
+		return_types.emplace_back(LogicalType::VARCHAR);
+	}
+	return fd;
+}
+
+// Like Register, but also exposes the `symbols` named parameter; passing
+// symbols := true resolves each record's instrument_id to its live raw symbol
+// (an extra `symbol` column) in a single in-order pass — see DbnFileReader's
+// symbol-tracking notes.
+template <table_function_t Inner, table_function_bind_t Bind>
+static void RegisterWithSymbols(ExtensionLoader &loader, const char *name) {
+	TableFunction f(name, {LogicalType::VARCHAR}, ScanWithBodyFilter<Inner>, BindWithSymbols<Bind>,
+	                ReadDbnInitGlobal);
+	f.projection_pushdown = true;
+	f.filter_pushdown = true;
+	f.named_parameters["symbols"] = LogicalType::BOOLEAN;
+	loader.RegisterFunction(f);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	Register<ReadDbnScan>(loader, "read_dbn", ReadDbnBind);
-	Register<TradesScan>(loader, "read_dbn_trades", TradesBind);
-	Register<MboScan>(loader, "read_dbn_mbo", MboBind);
-	Register<Mbp1Scan>(loader, "read_dbn_mbp1", Mbp1Bind);
-	Register<Mbp10Scan>(loader, "read_dbn_mbp10", Mbp10Bind);
-	Register<Bbo1sScan>(loader, "read_dbn_bbo_1s", BboBind);
-	Register<Bbo1mScan>(loader, "read_dbn_bbo_1m", BboBind);
-	Register<Cbbo1sScan>(loader, "read_dbn_cbbo_1s", CbboBind);
-	Register<Cmbp1Scan>(loader, "read_dbn_cmbp1", Cmbp1Bind);
-	Register<TbboScan>(loader, "read_dbn_tbbo", TbboBind);
-	Register<Ohlcv1sScan>(loader, "read_dbn_ohlcv_1s", OhlcvBind);
-	Register<Ohlcv1mScan>(loader, "read_dbn_ohlcv_1m", OhlcvBind);
-	Register<Ohlcv1hScan>(loader, "read_dbn_ohlcv_1h", OhlcvBind);
-	Register<Ohlcv1dScan>(loader, "read_dbn_ohlcv_1d", OhlcvBind);
-	Register<StatusScan>(loader, "read_dbn_status", StatusBind);
-	Register<ImbalanceScan>(loader, "read_dbn_imbalance", ImbalanceBind);
-	Register<StatisticsScan>(loader, "read_dbn_statistics", StatisticsBind);
-	Register<DefinitionScan>(loader, "read_dbn_definition", DefinitionBind);
-	Register<Cbbo1mScan>(loader, "read_dbn_cbbo_1m", CbboBind);
-	Register<OhlcvEodScan>(loader, "read_dbn_ohlcv_eod", OhlcvBind);
-	Register<TcbboScan>(loader, "read_dbn_tcbbo", Cmbp1Bind);
+	RegisterWithSymbols<TradesScan, TradesBind>(loader, "read_dbn_trades");
+	RegisterWithSymbols<MboScan, MboBind>(loader, "read_dbn_mbo");
+	RegisterWithSymbols<Mbp1Scan, Mbp1Bind>(loader, "read_dbn_mbp1");
+	RegisterWithSymbols<Mbp10Scan, Mbp10Bind>(loader, "read_dbn_mbp10");
+	RegisterWithSymbols<Bbo1sScan, BboBind>(loader, "read_dbn_bbo_1s");
+	RegisterWithSymbols<Bbo1mScan, BboBind>(loader, "read_dbn_bbo_1m");
+	RegisterWithSymbols<Cbbo1sScan, CbboBind>(loader, "read_dbn_cbbo_1s");
+	RegisterWithSymbols<Cmbp1Scan, Cmbp1Bind>(loader, "read_dbn_cmbp1");
+	RegisterWithSymbols<TbboScan, TbboBind>(loader, "read_dbn_tbbo");
+	RegisterWithSymbols<Ohlcv1sScan, OhlcvBind>(loader, "read_dbn_ohlcv_1s");
+	RegisterWithSymbols<Ohlcv1mScan, OhlcvBind>(loader, "read_dbn_ohlcv_1m");
+	RegisterWithSymbols<Ohlcv1hScan, OhlcvBind>(loader, "read_dbn_ohlcv_1h");
+	RegisterWithSymbols<Ohlcv1dScan, OhlcvBind>(loader, "read_dbn_ohlcv_1d");
+	RegisterWithSymbols<StatusScan, StatusBind>(loader, "read_dbn_status");
+	RegisterWithSymbols<ImbalanceScan, ImbalanceBind>(loader, "read_dbn_imbalance");
+	RegisterWithSymbols<StatisticsScan, StatisticsBind>(loader, "read_dbn_statistics");
+	RegisterWithSymbols<DefinitionScan, DefinitionBind>(loader, "read_dbn_definition");
+	RegisterWithSymbols<Cbbo1mScan, CbboBind>(loader, "read_dbn_cbbo_1m");
+	RegisterWithSymbols<OhlcvEodScan, OhlcvBind>(loader, "read_dbn_ohlcv_eod");
+	RegisterWithSymbols<TcbboScan, Cmbp1Bind>(loader, "read_dbn_tcbbo");
 	Register<SymbolMappingScan>(loader, "read_dbn_symbol_mapping", SymbolMappingBind);
 	Register<SystemScan>(loader, "read_dbn_system", SystemBind);
 

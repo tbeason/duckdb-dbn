@@ -1,0 +1,121 @@
+# name: test/sql/tcbbo_symbols.test
+# description: Opt-in symbol resolution (symbols := true) on the market-data
+#              readers. The instrument_id → raw-symbol binding is carried by
+#              SymbolMappingMsg records interleaved in the live stream; with
+#              symbols := true the reader resolves each record's instrument_id
+#              to its active output symbol in a single in-order pass, appending
+#              a `symbol` column. Stream order is the validity window, so a
+#              mid-stream remap takes effect for later records only.
+# group: [sql]
+
+require dbn
+
+# test_data.tcbbo_symbols.dbn stream order (see tools/gen_tcbbo_symbols.jl):
+#   map 5482→OPT5482, map 6001→OPT6001,
+#   tcbbo 5482, tcbbo 6001, tcbbo 9999 (never mapped),
+#   map 5482→OPT5482_B (remap), tcbbo 5482
+
+# ──────────────────────────────────────────────────────────────────────────
+# Resolution: each tcbbo record gets the active output symbol. 9999 has no
+# mapping → SQL NULL. The second 5482 sees the remap (OPT5482_B), proving the
+# resolution honors stream order rather than a single global binding.
+# ──────────────────────────────────────────────────────────────────────────
+
+query IT
+SELECT instrument_id, symbol
+FROM read_dbn_tcbbo('test/data/test_data.tcbbo_symbols.dbn', symbols := true)
+ORDER BY ts_event
+----
+5482	OPT5482
+6001	OPT6001
+9999	NULL
+5482	OPT5482_B
+
+# File order is preserved — symbols := true must not reorder records. The
+# positional sequence (no ORDER BY) matches the stream.
+query T
+SELECT symbol
+FROM read_dbn_tcbbo('test/data/test_data.tcbbo_symbols.dbn', symbols := true)
+----
+OPT5482
+OPT6001
+NULL
+OPT5482_B
+
+# Unmapped instrument → NULL (not empty string, not a stale symbol).
+query I
+SELECT count(*)
+FROM read_dbn_tcbbo('test/data/test_data.tcbbo_symbols.dbn', symbols := true)
+WHERE symbol IS NULL
+----
+1
+
+# Remap: the two 5482 quotes resolve to *different* symbols.
+query I
+SELECT count(DISTINCT symbol)
+FROM read_dbn_tcbbo('test/data/test_data.tcbbo_symbols.dbn', symbols := true)
+WHERE instrument_id = 5482
+----
+2
+
+# ──────────────────────────────────────────────────────────────────────────
+# Filter pushdown on the resolved column. `symbol` is a body column, so the
+# WHERE is applied by the body-filter pass after resolution — not dropped.
+# ──────────────────────────────────────────────────────────────────────────
+
+query II
+SELECT instrument_id, count(*)
+FROM read_dbn_tcbbo('test/data/test_data.tcbbo_symbols.dbn', symbols := true)
+WHERE symbol = 'OPT5482_B'
+GROUP BY instrument_id
+----
+5482	1
+
+# symbol-only projection (column not adjacent to instrument_id in output).
+query T
+SELECT symbol
+FROM read_dbn_tcbbo('test/data/test_data.tcbbo_symbols.dbn', symbols := true)
+WHERE symbol IS NOT NULL
+ORDER BY symbol
+----
+OPT5482
+OPT5482_B
+OPT6001
+
+# ──────────────────────────────────────────────────────────────────────────
+# Opt-in: without symbols := true there is no `symbol` column, and the row
+# count is unchanged from the plain read either way (4 tcbbo records; the 3
+# SymbolMappingMsg records are filtered out by rtype as before).
+# ──────────────────────────────────────────────────────────────────────────
+
+statement error
+SELECT symbol FROM read_dbn_tcbbo('test/data/test_data.tcbbo_symbols.dbn')
+----
+Referenced column "symbol" not found
+
+query I
+SELECT count(*) FROM read_dbn_tcbbo('test/data/test_data.tcbbo_symbols.dbn', symbols := true)
+----
+4
+
+# ──────────────────────────────────────────────────────────────────────────
+# The parameter is available on the other market-data readers too. A file with
+# no SymbolMappingMsg records resolves every row to NULL (nothing to bind) and
+# leaves the row count untouched — read_dbn_trades on the mappings-free trades
+# fixture.
+# ──────────────────────────────────────────────────────────────────────────
+
+query II
+SELECT count(*), count(symbol)
+FROM read_dbn_trades('test/data/test_data.trades.dbn', symbols := true)
+----
+2	0
+
+# ──────────────────────────────────────────────────────────────────────────
+# symbols := false is the default and adds no column.
+# ──────────────────────────────────────────────────────────────────────────
+
+statement error
+SELECT symbol FROM read_dbn_tcbbo('test/data/test_data.tcbbo_symbols.dbn', symbols := false)
+----
+Referenced column "symbol" not found
