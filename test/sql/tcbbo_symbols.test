@@ -112,6 +112,28 @@ FROM read_dbn_trades('test/data/test_data.trades.dbn', symbols := true)
 2	0
 
 # ──────────────────────────────────────────────────────────────────────────
+# Polymorphic read_dbn() supports symbols := true too — it dispatches to the
+# per-schema scan (here tcbbo), which resolves identically. Same column, same
+# in-order resolution incl. the mid-stream remap.
+# ──────────────────────────────────────────────────────────────────────────
+
+query IT
+SELECT instrument_id, symbol
+FROM read_dbn('test/data/test_data.tcbbo_symbols.dbn', symbols := true)
+ORDER BY ts_event
+----
+5482	OPT5482
+6001	OPT6001
+9999	NULL
+5482	OPT5482_B
+
+# read_dbn without the parameter has no symbol column.
+statement error
+SELECT symbol FROM read_dbn('test/data/test_data.tcbbo_symbols.dbn')
+----
+Referenced column "symbol" not found
+
+# ──────────────────────────────────────────────────────────────────────────
 # symbols := false is the default and adds no column.
 # ──────────────────────────────────────────────────────────────────────────
 

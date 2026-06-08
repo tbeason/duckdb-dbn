@@ -2511,6 +2511,22 @@ static void SystemScan(ClientContext &, TableFunctionInput &input, DataChunk &ou
 	out.SetCardinality(n);
 }
 
+// Append the opt-in `symbol` VARCHAR column when symbols := true was passed.
+// Shared by the per-schema bind wrapper (BindWithSymbols) and the polymorphic
+// read_dbn bind. The column is appended last, so its logical id equals the
+// prior column count. No-op when the parameter is absent/false.
+static void MaybeAppendSymbolColumn(TableFunctionBindInput &input, ReadDbnBindData &bd,
+                                    vector<LogicalType> &return_types, vector<string> &names) {
+	auto entry = input.named_parameters.find("symbols");
+	if (entry != input.named_parameters.end() && !entry->second.IsNull() &&
+	    BooleanValue::Get(entry->second)) {
+		bd.with_symbols = true;
+		bd.symbol_col_id = names.size();
+		names.emplace_back("symbol");
+		return_types.emplace_back(LogicalType::VARCHAR);
+	}
+}
+
 struct ReadDbnBindDataPolymorphic : public ReadDbnBindData {
 	table_function_t dispatched_scan = nullptr;
 };
@@ -2553,6 +2569,10 @@ static unique_ptr<FunctionData> ReadDbnBind(ClientContext &context, TableFunctio
 		break;
 	}
 	bd->dispatched_scan = handler->scan;
+	// Opt-in symbol resolution. The dispatched per-schema scan already
+	// snapshots symbols via NoteSymbol; here we just surface the column and
+	// flag the bind data so ReadDbnInitGlobal enables tracking.
+	MaybeAppendSymbolColumn(input, *bd, return_types, names);
 	return std::move(bd);
 }
 
@@ -2847,15 +2867,7 @@ template <table_function_bind_t Bind>
 static unique_ptr<FunctionData> BindWithSymbols(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	auto fd = Bind(context, input, return_types, names);
-	auto entry = input.named_parameters.find("symbols");
-	if (entry != input.named_parameters.end() && !entry->second.IsNull() &&
-	    BooleanValue::Get(entry->second)) {
-		auto &bd = fd->Cast<ReadDbnBindData>();
-		bd.with_symbols = true;
-		bd.symbol_col_id = names.size(); // appended last → id == prior column count
-		names.emplace_back("symbol");
-		return_types.emplace_back(LogicalType::VARCHAR);
-	}
+	MaybeAppendSymbolColumn(input, fd->Cast<ReadDbnBindData>(), return_types, names);
 	return fd;
 }
 
@@ -2874,7 +2886,18 @@ static void RegisterWithSymbols(ExtensionLoader &loader, const char *name) {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	Register<ReadDbnScan>(loader, "read_dbn", ReadDbnBind);
+	// read_dbn dispatches to a per-schema scan chosen from metadata.schema; it
+	// supports symbols := true the same way (the dispatched scan resolves), so
+	// it gets the named parameter directly rather than via RegisterWithSymbols
+	// (whose bind wrapper is templated on a single fixed schema bind).
+	{
+		TableFunction f("read_dbn", {LogicalType::VARCHAR}, ScanWithBodyFilter<ReadDbnScan>, ReadDbnBind,
+		                ReadDbnInitGlobal);
+		f.projection_pushdown = true;
+		f.filter_pushdown = true;
+		f.named_parameters["symbols"] = LogicalType::BOOLEAN;
+		loader.RegisterFunction(f);
+	}
 	RegisterWithSymbols<TradesScan, TradesBind>(loader, "read_dbn_trades");
 	RegisterWithSymbols<MboScan, MboBind>(loader, "read_dbn_mbo");
 	RegisterWithSymbols<Mbp1Scan, Mbp1Bind>(loader, "read_dbn_mbp1");
