@@ -43,11 +43,15 @@ the official `databento` Python decoder, and compares every column.
 ```sh
 pip install databento pandas pyarrow      # one-time
 python tools/diff_databento.py            # expects build/release/duckdb.exe present
+python tools/diff_databento.py trades     # restrict to one fixture/version
 ```
 
-Expected output: every schema `OK` except `statistics.quantity` (an **intentional**
-divergence — we surface the undefined `INT32_MAX` sentinel as SQL `NULL`, while
-databento keeps the raw int because an int column can't hold `NaN`). Run this
+Comparison is **exact** for integer / timestamp / string columns and uses a small
+tolerance only for genuine 1e-9 fixed-point price columns. It **exits nonzero** on
+any mismatch or reader error (CI-usable). The one **intentional** divergence —
+`statistics.quantity`, where we surface the undefined `INT32_MAX` sentinel as SQL
+`NULL` while databento keeps the raw int (an int column can't hold `NaN`) — is
+allowlisted (`EXPECTED_DIFF`), so a clean run reports all `OK` / exit 0. Run this
 after any change to decoding or column emission.
 
 ## Regenerating fixtures

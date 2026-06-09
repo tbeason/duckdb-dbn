@@ -46,7 +46,9 @@ def our_df(read_fn, path):
         r = subprocess.run([EXE, "-unsigned", "-c", sql], capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"our reader failed: {r.stderr.strip()[:300]}")
-        return pd.read_parquet(pq)
+        # numpy_nullable keeps NULL-bearing integer columns as nullable Int (not
+        # float64), so the comparison can stay EXACT for them.
+        return pd.read_parquet(pq, dtype_backend="numpy_nullable")
 
 def ref_df(path):
     # pretty_ts=True -> undefined timestamps become NaT (NULL), matching our
@@ -58,11 +60,34 @@ def ref_df(path):
             df[c] = df[c].dt.tz_localize(None)
     return df
 
-def norm_ts(s):
-    # our TIMESTAMP_NS -> int64 ns; databento pretty_ts=False is already int64 ns
-    if np.issubdtype(s.dtype, np.datetime64):
-        return s.astype("int64")
-    return s
+# Columns whose value INTENTIONALLY differs from databento (not bugs):
+#   statistics.quantity -> we surface the undefined sentinel as SQL NULL, while
+#   databento keeps the raw INT32_MAX (an int column can't hold NaN).
+EXPECTED_DIFF = {"statistics": {"quantity"}}
+
+def col_diffs(a, b, n):
+    """Element-wise compare two aligned Series. EXACT for ints/timestamps/strings;
+    a small tolerance ONLY for genuine float (1e-9 fixed-point price) columns.
+    Returns (num_diffs, first_(row, ours, ref) or None)."""
+    is_float = (a.dtype.kind == "f") or (b.dtype.kind == "f")
+    av, bv = a.tolist(), b.tolist()
+    diffs, first = 0, None
+    for k in range(n):
+        x, y = av[k], bv[k]
+        mx, my = pd.isna(x), pd.isna(y)
+        if mx and my:
+            continue
+        if mx != my:
+            ok = False
+        elif is_float:
+            ok = abs(float(x) - float(y)) <= 1e-6 + 1e-9 * abs(float(y))
+        else:
+            ok = (x == y)  # ints (exact), pd.Timestamp (exact to ns), strings
+        if not ok:
+            diffs += 1
+            if first is None:
+                first = (k, x, y)
+    return diffs, first
 
 def compare(read_fn, fixture, path=None):
     if path is None:
@@ -79,27 +104,16 @@ def compare(read_fn, fixture, path=None):
     if len(ours) != len(ref):
         issues.append(f"ROW COUNT ours={len(ours)} ref={len(ref)}")
     n = min(len(ours), len(ref))
-    common = [c for c in ours.columns if c in ref.columns]
+    skip = EXPECTED_DIFF.get(fixture, set())
+    common = [c for c in ours.columns if c in ref.columns and c not in skip]
     unmatched_ours = [c for c in ours.columns if c not in ref.columns]
     for c in common:
-        a = norm_ts(ours[c].iloc[:n].reset_index(drop=True))
-        b = norm_ts(ref[c].iloc[:n].reset_index(drop=True))
-        # numeric compare with tolerance; else exact (string/obj)
-        if np.issubdtype(a.dtype, np.number) and np.issubdtype(b.dtype, np.number):
-            an = pd.to_numeric(a, errors="coerce").to_numpy(dtype="float64")
-            bn = pd.to_numeric(b, errors="coerce").to_numpy(dtype="float64")
-            both_nan = np.isnan(an) & np.isnan(bn)
-            close = np.isclose(an, bn, rtol=1e-9, atol=1e-6, equal_nan=False)
-            bad = ~(close | both_nan)
-            if bad.any():
-                i = int(np.argmax(bad))
-                issues.append(f"col {c}: {int(bad.sum())} diffs (row {i}: ours={a.iloc[i]} ref={b.iloc[i]})")
-        else:
-            sa = a.astype("string").fillna("<NA>"); sb = b.astype("string").fillna("<NA>")
-            bad = (sa.to_numpy() != sb.to_numpy())
-            if bad.any():
-                i = int(np.argmax(bad))
-                issues.append(f"col {c}: {int(bad.sum())} diffs (row {i}: ours={sa.iloc[i]!r} ref={sb.iloc[i]!r})")
+        a = ours[c].iloc[:n].reset_index(drop=True)
+        b = ref[c].iloc[:n].reset_index(drop=True)
+        ndiff, first = col_diffs(a, b, n)
+        if ndiff:
+            i, x, y = first
+            issues.append(f"col {c}: {ndiff} diffs (row {i}: ours={x!r} ref={y!r})")
     status = "OK" if not issues else "FAIL"
     return (fixture, status, len(common), issues, unmatched_ours)
 
@@ -113,24 +127,33 @@ VERSIONS = [
 ]
 
 def main():
-    targets = MATRIX
+    entries = [(*m, None) for m in MATRIX] + [(f, l, p) for f, l, p in VERSIONS]
+    targets = sys.argv[1:]
+    if targets:
+        # restrict to entries matching a requested fixture label or path substring
+        entries = [e for e in entries
+                   if any(t == e[1] or t in e[1] or (e[2] and t in e[2]) for t in targets)]
+        if not entries:
+            print(f"no fixtures match {targets}", file=sys.stderr)
+            return 2
     print(f"{'fixture':<14} {'status':<6} {'cmp_cols':>8}  detail")
-    nfail = 0
-    for read_fn, fixture, *rest in [(*m, None) for m in MATRIX] + [(f, l, p) for f, l, p in VERSIONS]:
-        res = compare(read_fn, fixture, rest[0] if rest else None)
+    nbad = 0
+    for read_fn, fixture, path in entries:
+        res = compare(read_fn, fixture, path)
         fixture, status = res[0], res[1]
         ncols = res[2] if len(res) > 2 else 0
         issues = res[3] if len(res) > 3 else []
         unmatched = res[4] if len(res) > 4 else []
         print(f"{fixture:<14} {status:<6} {ncols:>8}  " +
               ("; ".join(issues[:4]) if issues else ("unmatched_ours=" + ",".join(unmatched) if unmatched else "")))
-        if status == "FAIL":
-            nfail += 1
+        if status == "FAIL" or status.startswith("ERROR"):
+            nbad += 1
             for x in issues:
                 print(f"    - {x}")
             if unmatched:
                 print(f"    (our cols not in ref: {unmatched})")
-    print(f"\n{nfail} schema(s) with value mismatches.")
+    print(f"\n{nbad} schema(s) with value mismatches or errors.")
+    return 1 if nbad else 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
