@@ -5,7 +5,6 @@
 #include <cstring>
 #include <deque>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -16,17 +15,47 @@
 
 namespace duckdb_dbn {
 
+// Minimal stand-in for std::optional (the extension compiles as C++14) covering
+// exactly the operations the readers use on the two nullable metadata fields.
+template <typename T>
+class Optional {
+public:
+	Optional() : has_(false), value_() {
+	}
+	Optional &operator=(T v) {
+		has_ = true;
+		value_ = v;
+		return *this;
+	}
+	bool has_value() const {
+		return has_;
+	}
+	const T &operator*() const {
+		return value_;
+	}
+	bool operator==(const Optional &other) const {
+		return has_ == other.has_ && (!has_ || value_ == other.value_);
+	}
+	bool operator!=(const Optional &other) const {
+		return !(*this == other);
+	}
+
+private:
+	bool has_;
+	T value_;
+};
+
 // Subset of the DBN metadata block we surface. The full struct in databento-cpp
 // (dbn.hpp's Metadata) pulls in date/date.h which forces a heavy transitive
 // dependency we want to avoid; this is the lightweight, stdlib-only form.
 struct DbnMetadata {
 	std::uint8_t version = 0;
 	std::string dataset; // up to 16 chars, NUL-trimmed
-	std::optional<databento::Schema> schema;
+	Optional<databento::Schema> schema;
 	std::int64_t start_ns = 0;
 	std::int64_t end_ns = 0;
 	std::uint64_t limit = 0;
-	std::optional<databento::SType> stype_in;
+	Optional<databento::SType> stype_in;
 	databento::SType stype_out = databento::SType::InstrumentId;
 	bool ts_out = false;
 	std::size_t symbol_cstr_len = 0;
@@ -64,7 +93,7 @@ public:
 		return first_metadata_.ts_out;
 	}
 
-	bool NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
+	bool NextRecordRaw(std::uint8_t *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
 	                   std::uint64_t *ts_out_out);
 
 	// Symbol resolution for live captures. When enabled, the reader watches the
@@ -94,7 +123,7 @@ public:
 		// buffer (refilled in large chunks), so the hot path makes neither a
 		// per-record input read nor a body copy — just the single memcpy into the
 		// caller's typed struct below.
-		const std::byte *p;
+		const std::uint8_t *p;
 		while ((p = NextRecordView(&hdr, &rec_len)) != nullptr) {
 			if (track_symbols_ && hdr.rtype == databento::RType::SymbolMapping) {
 				ObserveSymbolMapping(hdr, p, rec_len);
@@ -120,14 +149,14 @@ private:
 	bool AdvanceToNextFile();
 	// Decode a SymbolMappingMsg (version-aware) and update live_symbols_ with
 	// its instrument_id → stype_out_symbol binding. No-op on malformed length.
-	void ObserveSymbolMapping(const databento::RecordHeader &hdr, const std::byte *buf, std::size_t len);
+	void ObserveSymbolMapping(const databento::RecordHeader &hdr, const std::uint8_t *buf, std::size_t len);
 
 	// Block-buffered record reader. NextRecordView returns a pointer to the next
 	// record's contiguous bytes inside read_buf_ (valid until the next call),
 	// having consumed record + any ts_out trailer. EnsureBytes guarantees `n`
 	// contiguous bytes from buf_pos_, compacting and refilling from input_ in
 	// large reads — so per-record input reads collapse to ~one per block.
-	const std::byte *NextRecordView(databento::RecordHeader *hdr, std::size_t *record_len_bytes);
+	const std::uint8_t *NextRecordView(databento::RecordHeader *hdr, std::size_t *record_len_bytes);
 	bool EnsureBytes(std::size_t n);
 
 	static constexpr std::size_t kReadBufSize = 1u << 20; // 1 MiB block buffer
@@ -140,7 +169,7 @@ private:
 	bool first_opened_ = false;
 
 	// Block buffer for NextRecordView. Records are served from [buf_pos_, buf_len_).
-	std::vector<std::byte> read_buf_;
+	std::vector<std::uint8_t> read_buf_;
 	std::size_t buf_pos_ = 0;
 	std::size_t buf_len_ = 0;
 

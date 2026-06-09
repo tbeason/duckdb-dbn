@@ -1,6 +1,7 @@
 # name: test/sql/replacement_scan.test
 # description: SELECT * FROM '<path>.dbn' replacement scan
 # group: [sql]
+
 # .dbn.zst is intentionally NOT matched here — DuckDB's built-in machinery
 # intercepts .zst at parse time and routes it via the parquet extension before
 # any replacement scan runs. Use read_dbn('foo.dbn.zst') directly for those.

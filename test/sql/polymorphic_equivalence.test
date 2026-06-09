@@ -1,5 +1,7 @@
 # name: test/sql/polymorphic_equivalence.test
 # description: For every fixture, assert that polymorphic read_dbn(path)
+# group: [sql]
+
 #              returns exactly the same rows as the schema-specific
 #              read_dbn_<schema>(path). This is the only blanket-coverage
 #              test of the per-schema header_layout switch added in
@@ -7,7 +9,6 @@
 #              kHeaderLayoutOhlcv / Statistics / Standard based on
 #              md.schema). If any schema's polymorphic dispatch is wrong,
 #              its EXCEPT here will surface non-zero.
-# group: [sql]
 
 require dbn
 

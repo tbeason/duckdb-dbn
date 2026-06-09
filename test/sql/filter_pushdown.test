@@ -1,11 +1,12 @@
 # name: test/sql/filter_pushdown.test
 # description: Verify filter pushdown correctness. For each TableFilter shape
+# group: [sql]
+
 #              DuckDB hands us (ConstantFilter, InFilter, ConjunctionAndFilter,
 #              OptionalFilter), assert that the row set returned by the
 #              extension matches the same predicate evaluated against the
 #              golden CSV — including across schemas with non-standard
 #              header layouts (OHLCV: no ts_recv; Statistics: custom).
-# group: [sql]
 
 require dbn
 

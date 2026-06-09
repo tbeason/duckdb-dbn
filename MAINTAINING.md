@@ -14,7 +14,7 @@ Notes for whoever maintains this extension. For end-user docs see
 | `test/sql/*.test` | SQL test suite (sqllogictest format). |
 | `test/data/` | Binary fixtures (`.dbn`, `.dbn.zst`). |
 | `tools/` | Fixture generators + the `databento` differential harness. |
-| `third_party/databento-cpp` | Submodule: record structs / enums (currently v0.59.0). |
+| `src/include/databento/` | Vendored DBN record structs / enums (from databento-cpp v0.59.0, Apache-2.0; trimmed, no external dependency). |
 | `duckdb`, `extension-ci-tools` | Submodules pinned to the target DuckDB release. |
 | `.github/workflows/MainDistributionPipeline.yml` | CI (build + test + code quality). |
 | `docs/UPDATING.md` | Template doc: bumping to a new DuckDB version. |

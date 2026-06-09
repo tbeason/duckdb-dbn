@@ -1,10 +1,11 @@
 # name: test/sql/symbol_mapping_system.test
 # description: Live-gateway record schemas — read_dbn_symbol_mapping() and
+# group: [sql]
+
 #              read_dbn_system(). These rtypes are filtered out by the
 #              market-data readers (rtype-mismatched) and are how live
 #              captures carry raw-symbol↔instrument_id bindings and gateway
 #              session state.
-# group: [sql]
 
 require dbn
 

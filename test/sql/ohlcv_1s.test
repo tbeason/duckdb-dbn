@@ -1,6 +1,7 @@
 # name: test/sql/ohlcv_1s.test
 # description: read_dbn_ohlcv_1s() table function
 # group: [sql]
+
 # Note: the shipped fixtures store OHLCV prices ~100x what ES actually trades
 # at. The raw int64 values are scaled by the standard FixedPriceScale=1e9 per
 # the databento spec, so we emit 372025.0 etc. — synthetic test data.

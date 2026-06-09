@@ -1,12 +1,13 @@
 # name: test/sql/tcbbo_symbols.test
 # description: Opt-in symbol resolution (symbols := true) on the market-data
+# group: [sql]
+
 #              readers. The instrument_id → raw-symbol binding is carried by
 #              SymbolMappingMsg records interleaved in the live stream; with
 #              symbols := true the reader resolves each record's instrument_id
 #              to its active output symbol in a single in-order pass, appending
 #              a `symbol` column. Stream order is the validity window, so a
 #              mid-stream remap takes effect for later records only.
-# group: [sql]
 
 require dbn
 
