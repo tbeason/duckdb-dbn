@@ -2,8 +2,6 @@ cmake_minimum_required(VERSION 3.5)
 
 set(TARGET_NAME dbn)
 
-find_package(OpenSSL REQUIRED)
-
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
@@ -26,9 +24,6 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # definitions in libduckdb_static on GNU ld.
 target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_14)
 target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_14)
-
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 
 install(
   TARGETS ${EXTENSION_NAME}

@@ -4,7 +4,7 @@ This document is the Phase 0 walkthrough: get the unmodified extension template 
 
 ## What's already done
 
-The repo was scaffolded from `duckdb/extension-template` and renamed via the template's `bootstrap-template.py` script. Extension name is `dbn`. Sources live in `src/dbn_extension.cpp` and `src/include/dbn_extension.hpp`. Two placeholder scalar functions exist (`dbn(name)`, `dbn_openssl_version(name)`) — they'll be replaced in Phase 1 by a `read_dbn(path)` table function.
+The repo was scaffolded from `duckdb/extension-template` and renamed via the template's `bootstrap-template.py` script. Extension name is `dbn`. Sources live in `src/dbn_extension.cpp` and `src/include/dbn_extension.hpp`. (Historical note: the template's placeholder scalar functions and its OpenSSL example dependency are long gone — the extension has no vcpkg dependencies.)
 
 The repo has two git submodules that were NOT cloned yet (to keep the initial scaffold small): `duckdb/` (the full DuckDB source tree, several hundred MB) and `extension-ci-tools/` (build infrastructure). You'll initialize them in step 2 below.
 
@@ -110,7 +110,7 @@ switch ([BitConverter]::ToUInt16($b, $pe + 4)) {
 }
 ```
 
-First build is slow (vcpkg compiles OpenSSL; DuckDB itself compiles). Subsequent rebuilds use the cache. Expect 15–30 minutes for the first run.
+First build is slow (DuckDB itself compiles). Subsequent rebuilds use the cache. Expect 15–30 minutes for the first run.
 
 **Switching architectures.** vcpkg caches the *x86* and *x64* triplets in
 different `build/release/vcpkg_installed/` subdirs, so the `build/release`
@@ -155,7 +155,6 @@ The test in `test/sql/dbn.test` asserts the two placeholder functions work. Pass
 ## Common failure modes
 
 - **`cl.exe not found`** — you're not in a Developer PowerShell. Re-launch.
-- **vcpkg `find_package(OpenSSL)` fails** — `VCPKG_TOOLCHAIN_PATH` not exported. Echo it (`$env:VCPKG_TOOLCHAIN_PATH`) to confirm.
 - **Linker errors about missing DuckDB symbols** — submodules not initialized. Re-run `git submodule update --init --recursive`.
 - **CMake picks the wrong generator** — explicitly pass `-G "Visual Studio 17 2022" -A x64` to the configure step.
 - **Build runs out of disk** — vcpkg + DuckDB build artifacts together are 5–10 GB. Have headroom.
