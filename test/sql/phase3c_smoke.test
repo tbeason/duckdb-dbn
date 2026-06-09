@@ -1,6 +1,7 @@
 # name: test/sql/phase3c_smoke.test
 # description: smoke test for the 3 trivially-added schemas (cbbo-1m, ohlcv-eod, tcbbo)
 # group: [sql]
+
 # No upstream fixtures for these specific rtypes — we verify the functions are
 # registered, accept a path, and return 0 rows when given a fixture whose
 # record stream has a different rtype.

@@ -70,8 +70,7 @@ public:
 		}
 		const auto init_ret = duckdb_zstd::ZSTD_initDStream(dstream_);
 		if (duckdb_zstd::ZSTD_isError(init_ret)) {
-			throw std::runtime_error(std::string("dbn: ZSTD_initDStream: ") +
-			                         duckdb_zstd::ZSTD_getErrorName(init_ret));
+			throw std::runtime_error(std::string("dbn: ZSTD_initDStream: ") + duckdb_zstd::ZSTD_getErrorName(init_ret));
 		}
 		in_buf_.resize(duckdb_zstd::ZSTD_DStreamInSize());
 		zin_.src = in_buf_.data();
@@ -266,7 +265,7 @@ bool DbnFileReader::EnsureBytes(std::size_t n) {
 	return (buf_len_ - buf_pos_) >= n;
 }
 
-const std::byte *DbnFileReader::NextRecordView(databento::RecordHeader *hdr, std::size_t *record_len_bytes) {
+const std::uint8_t *DbnFileReader::NextRecordView(databento::RecordHeader *hdr, std::size_t *record_len_bytes) {
 	for (;;) {
 		if (!EnsureBytes(sizeof(databento::RecordHeader))) {
 			// A clean file boundary leaves zero unconsumed bytes; anything else is
@@ -297,7 +296,7 @@ const std::byte *DbnFileReader::NextRecordView(databento::RecordHeader *hdr, std
 			throw std::runtime_error("dbn: short read while reading record body in: " + current_path_);
 		}
 		// Re-fetch the pointer: EnsureBytes(total) may have compacted/reallocated.
-		const std::byte *p = read_buf_.data() + buf_pos_;
+		const std::uint8_t *p = read_buf_.data() + buf_pos_;
 		buf_pos_ += total;
 		if (record_len_bytes) {
 			*record_len_bytes = record_bytes;
@@ -306,10 +305,10 @@ const std::byte *DbnFileReader::NextRecordView(databento::RecordHeader *hdr, std
 	}
 }
 
-bool DbnFileReader::NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
+bool DbnFileReader::NextRecordRaw(std::uint8_t *buf, databento::RecordHeader *hdr, std::size_t *record_len_bytes,
                                   std::uint64_t *ts_out_out) {
 	std::size_t rec_len = 0;
-	const std::byte *p = NextRecordView(hdr, &rec_len);
+	const std::uint8_t *p = NextRecordView(hdr, &rec_len);
 	if (!p) {
 		return false;
 	}
@@ -325,8 +324,7 @@ bool DbnFileReader::NextRecordRaw(std::byte *buf, databento::RecordHeader *hdr, 
 	return true;
 }
 
-void DbnFileReader::ObserveSymbolMapping(const databento::RecordHeader &hdr, const std::byte *buf,
-                                         std::size_t len) {
+void DbnFileReader::ObserveSymbolMapping(const databento::RecordHeader &hdr, const std::uint8_t *buf, std::size_t len) {
 	// Pull stype_out_symbol — the output-symbology symbol bound to this
 	// instrument_id (the human-readable symbol, e.g. the OSI option symbol on
 	// OPRA). v2/v3 share the canonical 176-byte SymbolMappingMsg; v1 is the
@@ -355,8 +353,7 @@ void DbnFileReader::ObserveSymbolMapping(const databento::RecordHeader &hdr, con
 	// Skip the update if the binding is unchanged — keeps symbol_pool_ from
 	// growing on the (common) repeated-snapshot case.
 	auto it = live_symbols_.find(hdr.instrument_id);
-	if (it != live_symbols_.end() && it->second->size() == n &&
-	    std::memcmp(it->second->data(), sym, n) == 0) {
+	if (it != live_symbols_.end() && it->second->size() == n && std::memcmp(it->second->data(), sym, n) == 0) {
 		return;
 	}
 	symbol_pool_.emplace_back(sym, n);

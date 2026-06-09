@@ -1,7 +1,8 @@
 # name: test/sql/errors.test
 # description: Negative-path coverage. Confirms the extension surfaces real
-#              errors for unrecoverable inputs rather than silently misreading.
 # group: [sql]
+
+#              errors for unrecoverable inputs rather than silently misreading.
 
 require dbn
 

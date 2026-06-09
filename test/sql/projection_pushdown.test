@@ -1,8 +1,9 @@
 # name: test/sql/projection_pushdown.test
 # description: Verify projection pushdown across each DbnHeaderColumnLayout
+# group: [sql]
+
 #              variant. Ground truth: post-processed dbn-cli CSVs in
 #              test/data/expected/ (generated via tools/generate_expected.py).
-# group: [sql]
 #
 # Timestamps compared in BIGINT-nanoseconds space — extension emits
 # TIMESTAMP_NS so we apply epoch_ns() on that side; the CSV is raw int64.

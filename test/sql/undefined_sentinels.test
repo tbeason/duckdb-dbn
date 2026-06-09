@@ -1,5 +1,7 @@
 # name: test/sql/undefined_sentinels.test
 # description: DBN "undefined" sentinels surface as SQL NULL (matching the
+# group: [sql]
+
 #   databento reference), not the raw sentinel. Before this fix an undefined
 #   price (UNDEF_PRICE = INT64_MAX) was emitted as INT64_MAX/1e9 =
 #   9223372036.854776 — a finite garbage value that silently corrupted
@@ -7,7 +9,6 @@
 #   max(ask_price) return 9.2e9). Undefined timestamps (UINT64_MAX) and the
 #   statistics quantity sentinel (INT32_MAX / INT64_MAX) are nulled too.
 #   Cross-checked against databento via tools/diff_databento.py.
-# group: [sql]
 
 require dbn
 

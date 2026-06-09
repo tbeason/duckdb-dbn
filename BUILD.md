@@ -162,7 +162,7 @@ The test in `test/sql/dbn.test` asserts the two placeholder functions work. Pass
 
 ## When Phase 0 is done
 
-You should be able to launch a DuckDB CLI, `LOAD` the built extension, and run `SELECT dbn('hi');` returning the duck emoji string. At that point we know the toolchain is healthy and Phase 1 (replacing the placeholder functions with `read_dbn(path)` backed by `databento-cpp`) is just C++.
+You should be able to launch a DuckDB CLI, `LOAD` the built extension, and run `SELECT dbn('hi');` returning the duck emoji string. At that point we know the toolchain is healthy and Phase 1 (replacing the placeholder functions with `read_dbn(path)` backed by the vendored DBN record structs) is just C++.
 
 ## When Phase 0 doesn't work after a real effort
 

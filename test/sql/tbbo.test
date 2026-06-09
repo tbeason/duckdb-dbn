@@ -1,6 +1,7 @@
 # name: test/sql/tbbo.test
 # description: read_dbn_tbbo() table function
 # group: [sql]
+
 # TBBO uses Mbp1Msg + RType::Mbp1. Without metadata-schema parsing
 # read_dbn_tbbo and read_dbn_mbp1 return the same data on either file;
 # Phase 3 will gate them via Metadata.schema.

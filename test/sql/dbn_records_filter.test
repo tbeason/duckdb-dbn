@@ -1,11 +1,12 @@
 # name: test/sql/dbn_records_filter.test
 # description: Coverage for dbn_records() under its non-standard layout
+# group: [sql]
+
 #              kHeaderLayoutRecords {ts_event=0, instrument=4, publisher=3}
 #              and pushdown integration. The standard layout puts instrument
 #              at col 2 and publisher at col 3, so a misconfigured layout
 #              would silently route an instrument_id predicate to the
 #              publisher field.
-# group: [sql]
 
 require dbn
 
