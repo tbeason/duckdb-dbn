@@ -83,7 +83,7 @@ established naming/comment density) so the format check stays green.
 `.github/workflows/MainDistributionPipeline.yml` runs on every push / PR and calls
 DuckDB's reusable workflows:
 - `duckdb-stable-build` — builds the per-platform `dbn.duckdb_extension` binaries
-  and runs the test suite (`duckdb_version: v1.5.2`).
+  and runs the test suite (`duckdb_version: v1.5.3`).
 - `code-quality-check` — `format;tidy`.
 
 There is **no deploy/release job** — see Publishing below.
