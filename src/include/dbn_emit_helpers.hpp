@@ -12,7 +12,11 @@ namespace duckdb_dbn {
 // Emit a single-character VARCHAR cell (used for Action/Side enum-as-char and
 // for TriState / plain-char fields like auction_type, significant_imbalance).
 inline duckdb::string_t EmitChar1(duckdb::Vector &vec, char c) {
-	return duckdb::StringVector::AddString(vec, &c, 1);
+	// DBN char-enum fields use '\0' for "undefined"; surface that as an empty
+	// string (matching databento) rather than a 1-char NUL string. Real enum
+	// values (Action/Side/etc.) are always printable, so this only affects
+	// undefined cells.
+	return duckdb::StringVector::AddString(vec, &c, c == '\0' ? 0 : 1);
 }
 
 // Emit a NUL-terminated cstring from a fixed-width char buffer in the record.

@@ -1,0 +1,48 @@
+# name: test/sql/undefined_sentinels.test
+# description: DBN "undefined" sentinels surface as SQL NULL (matching the
+#   databento reference), not the raw sentinel. Before this fix an undefined
+#   price (UNDEF_PRICE = INT64_MAX) was emitted as INT64_MAX/1e9 =
+#   9223372036.854776 — a finite garbage value that silently corrupted
+#   aggregates (confirmed on real OPRA data: one-sided quotes made
+#   max(ask_price) return 9.2e9). Undefined timestamps (UINT64_MAX) and the
+#   statistics quantity sentinel (INT32_MAX / INT64_MAX) are nulled too.
+#   Cross-checked against databento via tools/diff_databento.py.
+# group: [sql]
+
+require dbn
+
+# definition: undefined price + timestamp fields are NULL (both fixture rows).
+query IIII
+SELECT
+  count(*) FILTER (WHERE strike_price IS NULL),
+  count(*) FILTER (WHERE high_limit_price IS NULL),
+  count(*) FILTER (WHERE expiration IS NULL),
+  count(*) FILTER (WHERE activation IS NULL)
+FROM read_dbn_definition('test/data/test_data.definition.dbn');
+----
+2	2	2	2
+
+# The garbage sentinel value must NEVER appear in a price column.
+query I
+SELECT count(*) FROM read_dbn_definition('test/data/test_data.definition.dbn')
+WHERE strike_price = 9223372036.854776
+   OR high_limit_price = 9223372036.854776
+   OR min_price_increment = 9223372036.854776;
+----
+0
+
+# statistics: undefined quantity (INT32_MAX) and ts_ref (UINT64_MAX) -> NULL.
+query II
+SELECT
+  count(*) FILTER (WHERE quantity IS NULL),
+  count(*) FILTER (WHERE ts_ref IS NULL)
+FROM read_dbn_statistics('test/data/test_data.statistics.dbn');
+----
+2	2
+
+# Sanity: always-present header fields are NOT nulled by the sentinel logic.
+query I
+SELECT count(*) FROM read_dbn_definition('test/data/test_data.definition.dbn')
+WHERE instrument_id IS NULL OR ts_event IS NULL OR length(raw_symbol) = 0;
+----
+0

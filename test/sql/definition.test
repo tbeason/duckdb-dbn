@@ -31,9 +31,11 @@ FROM read_dbn_definition('test/data/test_data.definition.dbn') LIMIT 1;
 ----
 VARCHAR	VARCHAR	USMALLINT
 
-# v1 source: leg_* NULL, trading_reference_* present
+# v1 source: leg_* are NULL (no legs in v1). The v1-only trading_reference_price
+# column exists but is the DBN UNDEF_PRICE sentinel in this fixture, now surfaced
+# as SQL NULL (matching databento) instead of 9223372036.854776.
 query II
-SELECT leg_count IS NULL, trading_reference_price IS NOT NULL
+SELECT leg_count IS NULL, trading_reference_price IS NULL
 FROM read_dbn_definition('test/data/test_data.definition.dbn') LIMIT 1;
 ----
 true	true
