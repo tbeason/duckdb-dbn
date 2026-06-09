@@ -1,102 +1,151 @@
-# Quack
+# duckdb-dbn
 
-This repository is based on https://github.com/duckdb/extension-template, check it out if you want to build and ship your own DuckDB extension.
+A [DuckDB](https://duckdb.org) extension for reading [Databento](https://databento.com)
+**DBN** (Databento Binary Encoding) files directly as SQL tables — including the
+`.dbn.zst` Zstandard-compressed captures Databento ships.
 
----
+```sql
+LOAD dbn;
 
-This extension, Quack, allow you to ... <extension_goal>.
+SELECT ts_event, instrument_id, price, size, side
+FROM read_dbn_trades('XNAS-20240101.trades.dbn.zst')
+WHERE side = 'B'
+ORDER BY ts_event
+LIMIT 10;
+```
 
+No conversion step, no Python — point a reader at a `.dbn` / `.dbn.zst` file (or a
+glob of them) and query it. Decoding is verified **bit-identical to the official
+`databento` Python decoder** across every schema and DBN version (see
+[Correctness](#correctness)).
+
+## Features
+
+- **All market-data schemas** — trades, mbo, mbp-1/mbp-10, tbbo, bbo, cbbo, cmbp-1,
+  tcbbo, ohlcv (1s/1m/1h/1d/eod), status, imbalance, statistics, definition.
+- **Compressed and uncompressed** — reads `.dbn` and `.dbn.zst` transparently.
+- **DBN v1, v2, and v3** — version-aware decoding; fields absent in older versions
+  are surfaced as SQL `NULL`.
+- **Globs / multi-file** — `read_dbn_trades('data/*.trades.dbn.zst')` reads many
+  files in order as one table (they must share schema, version, and `ts_out`).
+- **Filter & projection pushdown** — `WHERE`/column pruning are pushed into the
+  scan (header fields filtered during decode; body fields right after).
+- **Correct `NULL` semantics** — DBN "undefined" sentinels (e.g. one-sided quotes,
+  optional definition fields) are surfaced as SQL `NULL`, matching `databento` —
+  not as the raw sentinel, which would silently corrupt aggregates.
+- **Nanosecond timestamps** — all `ts_*` columns are `TIMESTAMP_NS`.
+- **Symbol resolution** — `symbols := true` resolves `instrument_id` to its raw
+  symbol inline for live captures (see [Symbol resolution](#symbol-resolution)).
+- **Replacement scan** — `SELECT * FROM 'file.dbn'` works without naming a function
+  (for schema-bearing files; dispatches to `read_dbn`).
+
+## Function reference
+
+Every reader takes a file path (or glob) as its first argument and returns the
+schema's records as rows.
+
+| Function | DBN schema |
+|---|---|
+| `read_dbn_trades(path)` | trades |
+| `read_dbn_mbo(path)` | mbo (market-by-order) |
+| `read_dbn_mbp1(path)` / `read_dbn_mbp10(path)` | mbp-1 / mbp-10 |
+| `read_dbn_tbbo(path)` | tbbo |
+| `read_dbn_bbo_1s(path)` / `read_dbn_bbo_1m(path)` | bbo-1s / bbo-1m |
+| `read_dbn_cmbp1(path)` | cmbp-1 (consolidated) |
+| `read_dbn_cbbo_1s(path)` / `read_dbn_cbbo_1m(path)` | cbbo-1s / cbbo-1m |
+| `read_dbn_tcbbo(path)` | tcbbo |
+| `read_dbn_ohlcv_1s/1m/1h/1d(path)`, `read_dbn_ohlcv_eod(path)` | ohlcv-* |
+| `read_dbn_status(path)` | status |
+| `read_dbn_imbalance(path)` | imbalance |
+| `read_dbn_statistics(path)` | statistics |
+| `read_dbn_definition(path)` | definition |
+| `read_dbn_symbol_mapping(path)` | SymbolMappingMsg (live gateway) |
+| `read_dbn_system(path)` | SystemMsg (live gateway) |
+| `read_dbn(path)` | **polymorphic** — dispatches on `metadata.schema` |
+| `dbn_metadata(path)` | one row of file metadata (version, dataset, schema, …) |
+| `dbn_records(path)` | raw record headers + body bytes (rtype-agnostic) |
+
+Named parameter (market-data readers): `symbols := true` (default `false`).
+
+`read_dbn` requires a `schema` in the file metadata. Live captures are often
+schema-less, so for those use the specific `read_dbn_<schema>()` reader.
+
+## Usage
+
+```sql
+-- Inspect a file first
+SELECT * FROM dbn_metadata('capture.dbn.zst');
+
+-- Query a schema
+SELECT count(*), avg(price) FROM read_dbn_trades('capture.dbn.zst');
+
+-- Glob many files (read in order)
+SELECT * FROM read_dbn_mbp1('data/2024-01-*.mbp-1.dbn.zst') WHERE instrument_id = 5482;
+
+-- Replacement scan (schema-bearing files)
+SELECT count(*) FROM 'historical.trades.dbn';
+```
+
+### Symbol resolution
+
+Live captures carry the `instrument_id → raw symbol` binding in interleaved
+`SymbolMappingMsg` records (`metadata.symbols` is empty). `symbols := true` resolves
+each record's symbol inline, in a single in-order pass:
+
+```sql
+SELECT ts_event, instrument_id, symbol, bid_price, ask_price
+FROM read_dbn_tcbbo('OPRA.PILLAR.tcbbo.dbn.zst', symbols := true);
+```
+
+The `symbol` column is `NULL` for any record whose mapping hasn't been seen yet.
+You can also read the mappings directly with `read_dbn_symbol_mapping(path)`.
+
+## Performance
+
+The readers are single-threaded and fast enough for ad-hoc work, but reading a
+large `.dbn.zst` is **decompression-bound** (a single Zstd frame must be
+decompressed serially). For **load-once / query-many** workloads, convert to a
+columnar format once and query that — it reads only the columns you touch and is
+dramatically faster:
+
+```sql
+COPY (SELECT * FROM read_dbn_tcbbo('big.dbn.zst'))
+  TO 'big.parquet' (FORMAT parquet, COMPRESSION zstd);
+-- then query big.parquet
+```
+
+DuckDB's native time-series features (ASOF JOIN, `time_bucket`, window functions)
+work well on the result for quote/trade alignment and bar building.
 
 ## Building
-### Managing dependencies
-DuckDB extensions uses VCPKG for dependency management. Enabling VCPKG is very simple: follow the [installation instructions](https://vcpkg.io/en/getting-started) or just run the following:
-```shell
-git clone https://github.com/Microsoft/vcpkg.git
-./vcpkg/bootstrap-vcpkg.sh
-export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
-```
-Note: VCPKG is only required for extensions that want to rely on it for dependency management. If you want to develop an extension without dependencies, or want to do your own dependency management, just skip this step. Note that the example extension uses VCPKG to build with a dependency for instructive purposes, so when skipping this step the build may not work without removing the dependency.
 
-### Build steps
-Now to build the extension, run:
+See **[BUILD.md](BUILD.md)** for the full walkthrough (Windows/x64 specifics
+included). In brief, with submodules initialized and vcpkg configured:
+
 ```sh
-make
-```
-The main binaries that will be built are:
-```sh
-./build/release/duckdb
-./build/release/test/unittest
-./build/release/extension/quack/quack.duckdb_extension
-```
-- `duckdb` is the binary for the duckdb shell with the extension code automatically loaded.
-- `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
-- `quack.duckdb_extension` is the loadable binary as it would be distributed.
-
-## Running the extension
-To run the extension code, simply start the shell with `./build/release/duckdb`.
-
-Now we can use the features from the extension directly in DuckDB. The template contains a single scalar function `quack()` that takes a string arguments and returns a string:
-```
-D select quack('Jane') as result;
-┌───────────────┐
-│    result     │
-│    varchar    │
-├───────────────┤
-│ Quack Jane 🐥 │
-└───────────────┘
+make            # builds build/release/extension/dbn/dbn.duckdb_extension + a duckdb shell
+make test       # runs the SQL test suite in test/sql
 ```
 
-## Running the tests
-Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:
-```sh
-make test
-```
+Load the built extension in any DuckDB started with `-unsigned`:
 
-### Installing the deployed binaries
-To install your extension binaries from S3, you will need to do two things. Firstly, DuckDB should be launched with the
-`allow_unsigned_extensions` option set to true. How to set this will depend on the client you're using. Some examples:
-
-CLI:
-```shell
-duckdb -unsigned
-```
-
-Python:
-```python
-con = duckdb.connect(':memory:', config={'allow_unsigned_extensions' : 'true'})
-```
-
-NodeJS:
-```js
-db = new duckdb.Database(':memory:', {"allow_unsigned_extensions": "true"});
-```
-
-Secondly, you will need to set the repository endpoint in DuckDB to the HTTP url of your bucket + version of the extension
-you want to install. To do this run the following SQL query in DuckDB:
 ```sql
-SET custom_extension_repository='bucket.s3.eu-west-1.amazonaws.com/<your_extension_name>/latest';
-```
-Note that the `/latest` path will allow you to install the latest extension version available for your current version of
-DuckDB. To specify a specific version, you can pass the version instead.
-
-After running these steps, you can install and load your extension using the regular INSTALL/LOAD commands in DuckDB:
-```sql
-INSTALL quack;
-LOAD quack;
+LOAD 'build/release/extension/dbn/dbn.duckdb_extension';
 ```
 
-## Setting up CLion
+## Correctness
 
-### Opening project
-Configuring CLion with this extension requires a little work. Firstly, make sure that the DuckDB submodule is available.
-Then make sure to open `./duckdb/CMakeLists.txt` (so not the top level `CMakeLists.txt` file from this repo) as a project in CLion.
-Now to fix your project path go to `tools->CMake->Change Project Root`([docs](https://www.jetbrains.com/help/clion/change-project-root-directory.html)) to set the project root to the root dir of this repo.
+The reader is differentially verified against the official `databento` Python
+decoder over every fixture and DBN version: decoding is bit-identical (see
+`tools/diff_databento.py`). The SQL test suite lives in `test/sql/`.
 
-### Debugging
-To set up debugging in CLion, there are two simple steps required. Firstly, in `CLion -> Settings / Preferences -> Build, Execution, Deploy -> CMake` you will need to add the desired builds (e.g. Debug, Release, RelDebug, etc). There's different ways to configure this, but the easiest is to leave all empty, except the `build path`, which needs to be set to `../build/{build type}`, and CMake Options to which the following flag should be added, with the path to the extension CMakeList:
+## Maintenance & publishing
 
-```
--DDUCKDB_EXTENSION_CONFIGS=<path_to_the_exentension_CMakeLists.txt>
-```
+See **[MAINTAINING.md](MAINTAINING.md)** (releasing, CI, regenerating fixtures,
+bumping the DuckDB version).
 
-The second step is to configure the unittest runner as a run/debug configuration. To do this, go to `Run -> Edit Configurations` and click `+ -> Cmake Application`. The target and executable should be `unittest`. This will run all the DuckDB tests. To specify only running the extension specific tests, add `--test-dir ../../.. [sql]` to the `Program Arguments`. Note that it is recommended to use the `unittest` executable for testing/development within CLion. The actual DuckDB CLI currently does not reliably work as a run target in CLion.
+## Acknowledgements
+
+Built from the [DuckDB extension template](https://github.com/duckdb/extension-template).
+DBN is a format by [Databento](https://databento.com); this is an independent
+reader and is not affiliated with Databento.
