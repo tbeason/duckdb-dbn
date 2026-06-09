@@ -93,7 +93,9 @@ There is **no deploy/release job** — see Publishing below.
 No automated deployment is configured today. Two paths:
 
 **A. DuckDB Community Extensions (recommended for public distribution).**
-Submit a descriptor to <https://github.com/duckdb/community-extensions>; once
+Submit a descriptor to <https://github.com/duckdb/community-extensions> (a
+ready-to-submit draft lives at `docs/community-extensions-descriptor.yml` —
+update `repo.ref` and `version` for each new release); once
 merged, users install with plain `INSTALL dbn; LOAD dbn;` from the community repo.
 This is the lowest-friction route for consumers and is the intended home for an
 extension like this.
