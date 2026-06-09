@@ -1,0 +1,53 @@
+# name: test/sql/body_filter_empty_chunk.test
+# description: Regression for the empty-mid-stream-chunk body-filter bug. The
+#   scan emits chunks of STANDARD_VECTOR_SIZE (2048). When a pushed-down body
+#   filter slices a full *intermediate* chunk to zero rows, the wrapper used to
+#   return that empty chunk — and PhysicalTableScan treats a non-EOF empty chunk
+#   as FINISHED, silently truncating the rest of the stream. ScanWithBodyFilter
+#   (shared by every per-schema reader) and dbn_records now loop until a
+#   non-empty chunk or true EOF. All shipped fixtures were <2048 rows, so this
+#   went unnoticed.
+#
+#   Fixture (tools/gen_bodyfilter_fixture.jl): 5000 TCBBO records,
+#     rows    0..2047 -> side 'A'  (chunk 0)
+#     rows 2048..4095 -> side 'B'  (chunk 1 — fully rejected by side='A')
+#     rows 4096..4999 -> side 'A'  (chunk 2)
+# group: [sql]
+
+require dbn
+
+# Sanity: full count unaffected.
+query I
+SELECT count(*) FROM read_dbn_tcbbo('test/data/test_data.tcbbo.bodyfilter.dbn')
+----
+5000
+
+# side='A' matches chunk 0 (2048) + chunk 2 (904) across the rejected middle
+# chunk. Pre-fix returned 2048 (scan stopped at the first empty chunk).
+query I
+SELECT count(*) FROM read_dbn_tcbbo('test/data/test_data.tcbbo.bodyfilter.dbn') WHERE side = 'A'
+----
+2952
+
+# side='B' rejects chunk 0 entirely → empty *first* chunk. Pre-fix returned 0.
+query I
+SELECT count(*) FROM read_dbn_tcbbo('test/data/test_data.tcbbo.bodyfilter.dbn') WHERE side = 'B'
+----
+2048
+
+# Pushed-down WHERE must equal the in-aggregate FILTER (FILTER is not pushed to
+# the scan, so it is the ground-truth count).
+query II
+SELECT
+  (SELECT count(*) FROM read_dbn_tcbbo('test/data/test_data.tcbbo.bodyfilter.dbn') WHERE side='A'),
+  (SELECT count(*) FILTER (WHERE side='A') FROM read_dbn_tcbbo('test/data/test_data.tcbbo.bodyfilter.dbn'))
+----
+2952	2952
+
+# Projecting a column other than the filtered one still returns every match
+# (the filtered chunk must not terminate the scan regardless of projection).
+# ts_event is distinct per record in the fixture (ts = T0 + i*1e6).
+query I
+SELECT count(DISTINCT ts_event) FROM read_dbn_tcbbo('test/data/test_data.tcbbo.bodyfilter.dbn') WHERE side = 'A'
+----
+2952

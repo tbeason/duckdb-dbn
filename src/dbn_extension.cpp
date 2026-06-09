@@ -2821,32 +2821,44 @@ static void FillSymbolColumn(ReadDbnGlobalState &st, DataChunk &out) {
 template <table_function_t Inner>
 static void ScanWithBodyFilter(ClientContext &c, TableFunctionInput &input, DataChunk &out) {
 	auto &st = input.global_state->Cast<ReadDbnGlobalState>();
-	// Reset per-chunk snapshots so a row the inner scan fails to annotate
-	// degrades to SQL NULL rather than reusing a stale pointer from the
-	// previous chunk.
-	if (st.with_symbols) {
-		st.sym_scratch.fill(nullptr);
-	}
-	Inner(c, input, out);
-	if (out.size() == 0) {
+	// IMPORTANT: a non-EOF EMPTY chunk makes PhysicalTableScan report FINISHED
+	// (IMPLICIT async contract) and stop the scan early — losing the rest of the
+	// stream. The inner scan only returns an empty chunk at true EOF, but a
+	// selective body filter can slice a full chunk down to zero rows mid-stream.
+	// Loop until we have a non-empty chunk OR the inner scan signals EOF.
+	while (true) {
+		// Reset per-chunk snapshots so a row the inner scan fails to annotate
+		// degrades to SQL NULL rather than reusing a stale pointer from the
+		// previous chunk.
+		if (st.with_symbols) {
+			st.sym_scratch.fill(nullptr);
+		}
+		out.Reset(); // restore flat vectors if a prior iteration sliced the chunk
+		Inner(c, input, out);
+		if (out.size() == 0) {
+			return; // inner scan exhausted the stream — true EOF
+		}
+		if (st.with_symbols) {
+			FillSymbolColumn(st, out);
+		}
+		if (!st.filters) {
+			return;
+		}
+		// Build the Expression once on the first chunk that has data (need a
+		// populated DataChunk for projected column types), then reuse.
+		if (!st.body_filter_built) {
+			auto &bd = input.bind_data->Cast<ReadDbnBindData>();
+			st.body_filter_expr = BuildBodyFilterExpr(*st.filters, st.column_ids,
+			                                          bd.header_layout, out);
+			st.body_filter_built = true;
+		}
+		if (st.body_filter_expr) {
+			EvalBodyFilterExpr(c, *st.body_filter_expr, out);
+		}
+		if (out.size() == 0) {
+			continue; // body filter rejected this whole chunk — not EOF, keep going
+		}
 		return;
-	}
-	if (st.with_symbols) {
-		FillSymbolColumn(st, out);
-	}
-	if (!st.filters) {
-		return;
-	}
-	// Build the Expression once on the first chunk that has data (need a
-	// populated DataChunk for projected column types), then reuse.
-	if (!st.body_filter_built) {
-		auto &bd = input.bind_data->Cast<ReadDbnBindData>();
-		st.body_filter_expr = BuildBodyFilterExpr(*st.filters, st.column_ids,
-		                                          bd.header_layout, out);
-		st.body_filter_built = true;
-	}
-	if (st.body_filter_expr) {
-		EvalBodyFilterExpr(c, *st.body_filter_expr, out);
 	}
 }
 
@@ -2927,21 +2939,31 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// dbn_records uses its own bind/global state and a hardcoded Records layout
 	// {ts_event=0, instrument=4, publisher=3}, so it gets its own wrapper.
 	auto records_scan = +[](ClientContext &c, TableFunctionInput &input, DataChunk &out) {
-		DbnRecordsScan(c, input, out);
-		if (out.size() == 0) {
-			return;
-		}
+		// See ScanWithBodyFilter: loop so a body filter that slices an entire
+		// mid-stream chunk to zero rows does not emit a premature empty chunk
+		// (which PhysicalTableScan would treat as end-of-scan, truncating output).
 		auto &st = input.global_state->Cast<DbnRecordsGlobalState>();
-		if (!st.filters) {
+		while (true) {
+			out.Reset();
+			DbnRecordsScan(c, input, out);
+			if (out.size() == 0) {
+				return; // true EOF
+			}
+			if (!st.filters) {
+				return;
+			}
+			if (!st.body_filter_built) {
+				st.body_filter_expr = BuildBodyFilterExpr(*st.filters, st.column_ids,
+				                                          kHeaderLayoutRecords, out);
+				st.body_filter_built = true;
+			}
+			if (st.body_filter_expr) {
+				EvalBodyFilterExpr(c, *st.body_filter_expr, out);
+			}
+			if (out.size() == 0) {
+				continue; // whole chunk filtered out — keep scanning
+			}
 			return;
-		}
-		if (!st.body_filter_built) {
-			st.body_filter_expr = BuildBodyFilterExpr(*st.filters, st.column_ids,
-			                                          kHeaderLayoutRecords, out);
-			st.body_filter_built = true;
-		}
-		if (st.body_filter_expr) {
-			EvalBodyFilterExpr(c, *st.body_filter_expr, out);
 		}
 	};
 	TableFunction rf("dbn_records", {LogicalType::VARCHAR}, records_scan, DbnRecordsBind, DbnRecordsInitGlobal);
