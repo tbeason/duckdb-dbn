@@ -3703,6 +3703,8 @@ static const char *SystemCodeToCstr(databento::SystemCode c) {
 		return "replay_completed";
 	case databento::SystemCode::EndOfInterval:
 		return "end_of_interval";
+	case databento::SystemCode::UnsubscribeAck:
+		return "unsubscribe_ack";
 	case databento::SystemCode::Unset:
 		return "unset";
 	default:
@@ -3905,7 +3907,7 @@ static void SymbolMappingScan(ClientContext &, TableFunctionInput &input, DataCh
 //   v2/v3 (320 B): hd + msg[303] + code (SystemCode enum)
 //   v1     (80 B): hd + msg[64] (no code; code emitted as SQL NULL)
 // Gateway session messages: heartbeat, subscription_ack, slow_reader_warning,
-// replay_completed, end_of_interval. Layout: kHeaderLayoutOhlcv.
+// replay_completed, end_of_interval, unsubscribe_ack. Layout: kHeaderLayoutOhlcv.
 // ═════════════════════════════════════════════════════════════════════════════
 
 static unique_ptr<FunctionData> SystemBind(ClientContext &context, TableFunctionBindInput &input,

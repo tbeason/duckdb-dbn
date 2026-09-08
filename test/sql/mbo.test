@@ -14,9 +14,9 @@ SELECT count(*) FROM read_dbn_mbo('test/data/test_data.mbo.dbn');
 ----
 2
 
-# Wire-format interpretation (databento-cpp's MboMsg). Julia DBN.jl's
-# read_mbo_msg has a layout bug: it reads bytes 16-23 as ts_recv and bytes
-# 40-47 as price, opposite of the wire format.
+# Wire-format interpretation (databento-cpp's MboMsg): order_id @16, price @24,
+# ts_recv @40. (DatabentoBinaryEncoding.jl <= 0.1.6 read these three swapped;
+# fixed upstream in its next release.)
 query IIIIIRITTIIII
 SELECT
     epoch_ns(ts_event),

@@ -2,7 +2,8 @@
 // Apache License 2.0 — see LICENSE in this directory. Trimmed to the enums the
 // dbn extension consumes: API-client enums, ToString/FromString declarations and
 // iostream operators are removed. The enumerator values are the DBN wire format
-// and must not be changed.
+// and must not be changed. Enumerator lists were re-synced against dbn 0.69.0
+// (2026-09): StatType 21-26 and SystemCode::UnsubscribeAck postdate v0.59.0.
 #pragma once
 
 #include <cstdint>
@@ -237,6 +238,13 @@ enum StatType : std::uint16_t {
 	LowerPriceLimit = 18,
 	BlockVolume = 19,
 	IndicativeClosePrice = 20,
+	// Synced from dbn 0.69.0 (2026-09); not present in databento-cpp v0.59.0.
+	MwcbLevel1 = 21,
+	MwcbLevel2 = 22,
+	MwcbLevel3 = 23,
+	AuctionCollarReferencePrice = 24,
+	AuctionCollarUpperPrice = 25,
+	AuctionCollarLowerPrice = 26,
 	VenueSpecificVolume1 = 10001,
 	VenueSpecificPrice1 = 10002,
 };
@@ -358,6 +366,8 @@ enum SystemCode : std::uint8_t {
 	// Signals that all records for interval-based schemas have been published for
 	// the given timestamp.
 	EndOfInterval = 4,
+	// An acknowledgement of an unsubscribe request (added in dbn 0.69.0).
+	UnsubscribeAck = 5,
 	// No system code was specified or this record was upgraded from a version 1
 	// struct where the code field didn't exist.
 	Unset = 255,

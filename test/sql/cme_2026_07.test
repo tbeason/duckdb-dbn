@@ -1,0 +1,131 @@
+# name: test/sql/cme_2026_07.test
+# description: Databento CME (GLBX.MDP3) normalization changes of 2026-07-07
+# group: [sql]
+
+#   https://databento.com/blog/cme-normalization-changes-2026-07
+#
+#   Fixtures are DBN v3 files written with DatabentoBinaryEncoding.jl and
+#   shaped like the post-change feed:
+#     1. MBO: F_LAST (flags bit 128) is no longer set on the final book update;
+#        a standalone record with action='N', flags=128, price=UNDEF_PRICE,
+#        size=0 and its own ts_recv marks the end of the event.
+#     2. definition: one record per strategy leg (same instrument_id, leg_index
+#        0..leg_count-1) instead of one record per strategy.
+#     3. definition: FX spot instruments carry instrument_class='X'.
+#     4. statistics: stat_type 17 (upper price limit) / 18 (lower price limit).
+#     5. status: trading_event 3 (implied matching on) / 4 (implied matching off).
+#   The extension emits all of these fields raw (char / USMALLINT / UTINYINT),
+#   so this test pins down that they pass through unchanged and that the
+#   F_LAST record's undefined price surfaces as SQL NULL, not as a number.
+
+require dbn
+
+# ── 1. MBO: standalone F_LAST terminator ────────────────────────────────────
+
+query I
+SELECT count(*) FROM read_dbn_mbo('test/data/cme_2026_07.mbo.v3.dbn');
+----
+3
+
+query IRITTIII
+SELECT sequence::BIGINT, price, size::BIGINT, action, side, flags::BIGINT,
+       (flags & 128) <> 0 AS is_last, price IS NULL AS price_null
+FROM read_dbn_mbo('test/data/cme_2026_07.mbo.v3.dbn')
+ORDER BY sequence;
+----
+1	5000.0	3	A	B	0	false	false
+2	5000.25	2	A	A	0	false	false
+3	NULL	0	N	N	128	true	true
+
+# The book updates themselves no longer carry F_LAST.
+query I
+SELECT count(*) FROM read_dbn_mbo('test/data/cme_2026_07.mbo.v3.dbn')
+WHERE action <> 'N' AND (flags & 128) <> 0;
+----
+0
+
+# The terminator has its own (later) ts_recv, separate from the event records.
+query I
+SELECT max(ts_recv) FILTER (WHERE action = 'N') > max(ts_recv) FILTER (WHERE action <> 'N')
+FROM read_dbn_mbo('test/data/cme_2026_07.mbo.v3.dbn');
+----
+true
+
+# The undefined-price sentinel must never leak into aggregates.
+query RR
+SELECT max(price), avg(price) FROM read_dbn_mbo('test/data/cme_2026_07.mbo.v3.dbn');
+----
+5000.25	5000.125
+
+# Filter pushdown on action / flags works across the terminator record.
+query II
+SELECT count(*) FILTER (WHERE action = 'N'), count(*) FILTER (WHERE flags = 128)
+FROM read_dbn_mbo('test/data/cme_2026_07.mbo.v3.dbn');
+----
+1	1
+
+# Polymorphic read_dbn() sees the same rows.
+query I
+SELECT count(*) FROM read_dbn('test/data/cme_2026_07.mbo.v3.dbn');
+----
+3
+
+# ── 2./3. definition: per-leg records, FX spot class ─────────────────────────
+
+query I
+SELECT count(*) FROM read_dbn_definition('test/data/cme_2026_07.definition.v3.dbn');
+----
+3
+
+# A straddle produces one row per leg sharing the strategy's instrument_id.
+query IIIITTTTT
+SELECT instrument_id::BIGINT, leg_count::BIGINT, leg_index::BIGINT, leg_instrument_id::BIGINT,
+       leg_raw_symbol, leg_side, leg_instrument_class, instrument_class, raw_symbol
+FROM read_dbn_definition('test/data/cme_2026_07.definition.v3.dbn')
+WHERE instrument_id = 100
+ORDER BY leg_index;
+----
+100	2	0	201	ESM6 C5000	B	C	T	UD:1V: VT 0625K5000
+100	2	1	202	ESM6 P5000	A	P	T	UD:1V: VT 0625K5000
+
+# Grouping by instrument_id is no longer 1:1 with rows for strategies.
+query II
+SELECT count(*), count(DISTINCT instrument_id)
+FROM read_dbn_definition('test/data/cme_2026_07.definition.v3.dbn');
+----
+3	2
+
+# FX spot is 'X' (previously grouped under 'F').
+query TTI
+SELECT raw_symbol, instrument_class, leg_count::BIGINT
+FROM read_dbn_definition('test/data/cme_2026_07.definition.v3.dbn')
+WHERE instrument_id = 300;
+----
+EURUSD	X	0
+
+query II
+SELECT count(*) FILTER (WHERE instrument_class = 'X'),
+       count(*) FILTER (WHERE instrument_class = 'F')
+FROM read_dbn_definition('test/data/cme_2026_07.definition.v3.dbn');
+----
+1	0
+
+# ── 4. statistics: price limits ──────────────────────────────────────────────
+
+query IIRI
+SELECT sequence::BIGINT, stat_type::BIGINT, price, quantity IS NULL
+FROM read_dbn_statistics('test/data/cme_2026_07.statistics.v3.dbn')
+ORDER BY sequence;
+----
+1	17	5100.0	true
+2	18	4900.0	true
+
+# ── 5. status: implied matching on / off ─────────────────────────────────────
+
+query IIITT
+SELECT action::BIGINT, reason::BIGINT, trading_event::BIGINT, is_trading, is_quoting
+FROM read_dbn_status('test/data/cme_2026_07.status.v3.dbn')
+ORDER BY ts_event;
+----
+7	0	3	Y	Y
+7	0	4	Y	Y
